@@ -1,0 +1,23 @@
+name: Daily Attio Sync
+on:
+  schedule:
+    - cron: '0 5 * * *' # Runs at 5am UTC daily
+  workflow_dispatch: # Allows manual click to run
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.9'
+      - name: Install libraries
+        run: pip install -r requirements.txt
+      - name: Run Script
+        env:
+          ATTIO_API_KEY: ${{ secrets.ATTIO_API_KEY }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_KEY: ${{ secrets.SUPABASE_KEY }}
+        run: python sync_attio.py
