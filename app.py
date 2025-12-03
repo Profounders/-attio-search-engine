@@ -1,34 +1,10 @@
 import streamlit as st
 from supabase import create_client
 
-# Page Setup
+# --- 1. PAGE CONFIG ---
 st.set_page_config(page_title="Attio Search", layout="wide")
-st.title("🔍 Attio Search Engine")
 
-# ... imports ...
-st.title("🔍 Attio Search Engine")
-
-# --- DEBUG SECTION ---
-try:
-    # Get a simple count of all rows
-    response = supabase.table("attio_index").select("id", count="exact").execute()
-    total_count = response.count
-    st.metric(label="Total Records in Database", value=total_count)
-    
-    if total_count > 0:
-        # Show the most recent 3 items to verify data quality
-        st.caption("Most recent updates:")
-        recent = supabase.table("attio_index").select("title, type, created_at").order("created_at", desc=True).limit(3).execute()
-        st.table(recent.data)
-    else:
-        st.error("The database is empty. The Sync Script ran, but uploaded 0 items.")
-except Exception as e:
-    st.error(f"Database Check Failed: {e}")
-# --- END DEBUG ---
-
-# ... rest of your code ...
-
-# Connect DB
+# --- 2. CONNECT TO SUPABASE ---
 @st.cache_resource
 def init_connection():
     url = st.secrets["SUPABASE_URL"]
@@ -36,59 +12,87 @@ def init_connection():
     return create_client(url, key)
 
 try:
+    # Initialize the client BEFORE using it
     supabase = init_connection()
 except Exception as e:
-    st.error(f"Could not connect to database. Check Secrets. Error: {e}")
+    st.error(f"❌ Could not connect to database. Check Streamlit Secrets. Error: {e}")
     st.stop()
 
-# Sidebar
+# --- 3. TITLE & DEBUG SECTION ---
+st.title("🔍 Attio Search Engine")
+
+# This section checks if data exists. 
+# It will disappear automatically if you want, or you can keep it to monitor sync status.
+try:
+    # Get a quick count
+    count_response = supabase.table("attio_index").select("id", count="exact").execute()
+    total_count = count_response.count
+    
+    if total_count == 0:
+        st.error("⚠️ Database is connected but EMPTY. The Sync Script hasn't uploaded any data yet.")
+    else:
+        st.caption(f"✅ Database Status: Online | {total_count} records indexed.")
+        
+except Exception as e:
+    st.warning(f"Could not verify database stats: {e}")
+
+
+# --- 4. SIDEBAR FILTERS ---
 st.sidebar.title("Filters")
 type_filter = st.sidebar.multiselect(
     "Data Types",
-    ["person", "company", "note", "task", "comment", "call_recording", "list"],
+    # These are common Attio types. The sync script might add more dynamically.
+    ["person", "company", "note", "task", "comment", "call_recording", "list", "deal", "meeting"],
     default=["person", "company", "note"]
 )
 
-# Search Input
+# --- 5. SEARCH LOGIC ---
 query = st.text_input("Search...", placeholder="Type query here (e.g. 'Project Alpha')")
 
 if query:
-    # 1. Start the query builder
+    # A. Start Query
     req = supabase.table("attio_index").select("*")
     
-    # 2. Apply Filters FIRST (Chain safer)
+    # B. Apply Filters FIRST
     if type_filter:
         req = req.in_("type", type_filter)
     
-    # 3. Apply Search LAST
+    # C. Apply Text Search LAST
     req = req.text_search("fts", query)
         
-    # 4. Execute
+    # D. Execute
     try:
         results = req.execute().data
         
         st.markdown(f"**Found {len(results)} results**")
         
-        # 5. Display Results (Indented correctly now)
+        # E. Render Results
         for item in results:
             with st.container():
+                # Dynamic Icons
+                t = item['type']
                 emoji = "📄"
-                if item['type'] == 'person': emoji = "👤"
-                if item['type'] == 'company': emoji = "🏢"
-                if item['type'] == 'call_recording': emoji = "📞"
-                if item['type'] == 'task': emoji = "✅"
-                if item['type'] == 'note': emoji = "📝"
+                if t == 'person': emoji = "👤"
+                elif t == 'company': emoji = "🏢"
+                elif t == 'note': emoji = "📝"
+                elif t == 'task': emoji = "✅"
+                elif t in ['call_recording', 'meeting', 'call']: emoji = "📞"
+                elif t == 'deal': emoji = "💰"
                 
-                # Title and Link
+                # Title & Link
                 st.subheader(f"{emoji} {item['title']}")
                 url = item.get('url', '#')
-                st.markdown(f"**Type:** {item['type'].upper()} | [View in Attio]({url})")
+                st.markdown(f"**Type:** {t.upper()} | [View in Attio]({url})")
                 
-                # Content Preview (Handle None values safely)
+                # Content Preview
                 content = item.get('content') or ""
-                preview = content[:300] + "..." if len(content) > 300 else content
-                st.info(preview)
+                # clean up brackets if it's raw data
+                if len(content) > 300:
+                    preview = content[:300] + "..."
+                else:
+                    preview = content
                 
+                st.info(preview)
                 st.divider()
 
     except Exception as e:
