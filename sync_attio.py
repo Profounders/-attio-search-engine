@@ -9,10 +9,10 @@ ATTIO_API_KEY = os.environ.get("ATTIO_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-# Global flag to track if we successfully got notes the fast way
+# Track if we managed to get notes the fast way
 NOTES_ALREADY_SYNCED = False
 
-print("🚀 Starting Sync V9 (Streaming + Fast Notes)...")
+print("🚀 Starting Sync V10 (Notes First + Anti-Timeout)...")
 
 if not ATTIO_API_KEY or not SUPABASE_URL:
     print("❌ Error: Secrets missing.")
@@ -35,26 +35,21 @@ def make_request(method, endpoint, payload=None, params=None):
     
     for attempt in range(3):
         try:
-            # Reduced sleep time for speed (0.1s)
-            time.sleep(0.1)
+            time.sleep(0.1) # Brief pause
             
             if method == "POST":
-                response = requests.post(url, headers=headers, json=payload)
+                response = requests.post(url, headers=headers, json=payload, timeout=60)
             else:
-                response = requests.get(url, headers=headers, params=params)
+                response = requests.get(url, headers=headers, params=params, timeout=60)
 
             if response.status_code == 429:
-                print(f"   ⚠️ Rate Limit. Sleeping 5s...")
+                print(f"   ⚠️ API Rate Limit. Sleeping 5s...")
                 time.sleep(5)
                 continue 
             
             if response.status_code != 200:
-                # Return None so we know it failed, rather than empty list
-                if attempt == 2: 
-                     # Only print error on final attempt to reduce noise
-                     # check if it is just a 404 (not found) which is fine
-                     if response.status_code != 404:
-                         print(f"   ⚠️ API {response.status_code} on {endpoint}")
+                if attempt == 2 and response.status_code != 404:
+                     print(f"   ⚠️ API {response.status_code} on {endpoint}")
                 return None
 
             data = response.json().get("data", [])
@@ -64,58 +59,72 @@ def make_request(method, endpoint, payload=None, params=None):
             time.sleep(1)
     return None
 
-def upsert_batch(items):
+def safe_upsert(items, batch_size=50):
+    """
+    Saves items in small chunks to prevent Supabase Timeouts (57014).
+    If a chunk fails, it retries with a smaller chunk.
+    """
     if not items: return
-    try:
-        # Clean metadata
-        for item in items:
-            if "metadata" in item and item["metadata"]:
-                item["metadata"] = {k: v for k, v in item["metadata"].items() if v is not None}
+
+    total = len(items)
+    
+    # Process in chunks
+    for i in range(0, total, batch_size):
+        chunk = items[i:i+batch_size]
         
-        supabase.table("attio_index").upsert(items).execute()
-        # Print a dot for progress
-        print(f"   💾 Saved batch of {len(items)} items.")
-    except Exception as e:
-        print(f"   ❌ DB Error: {e}")
+        try:
+            # Clean metadata
+            for item in chunk:
+                if "metadata" in item and item["metadata"]:
+                    item["metadata"] = {k: v for k, v in item["metadata"].items() if v is not None}
+            
+            # Attempt Upsert
+            supabase.table("attio_index").upsert(chunk).execute()
+            print(f"   💾 Saved {len(chunk)} items...")
+            
+        except Exception as e:
+            error_msg = str(e)
+            # Check for Timeout (57014) or Connection Error
+            if "57014" in error_msg or "timeout" in error_msg.lower():
+                print(f"   ⚠️ DB Timeout. Retrying with smaller batch (10 items)...")
+                time.sleep(2)
+                # Recursive retry with safe size
+                safe_upsert(chunk, batch_size=10)
+            else:
+                print(f"   ❌ DB Error: {e}")
 
 # --- FAST SYNC FUNCTIONS ---
-def try_global_notes_sync():
+def sync_notes_first():
     """
-    Attempts to fetch ALL notes globally. 
-    If this works, we save hours of time.
+    PRIORITY 1: Fetch ALL notes globally before doing anything else.
     """
     global NOTES_ALREADY_SYNCED
-    print("\n⚡ Attempting Fast Note Sync...")
+    print("\n📝 PRIORITY: Syncing Notes...")
     
     # Try getting notes without ANY parameters (Global List)
     notes = make_request("GET", "notes")
     
-    if notes is not None:
-        print(f"   ✅ Fast Sync worked! Found {len(notes)} notes globally.")
+    if notes:
+        print(f"   ✅ Found {len(notes)} notes globally. Saving...")
         batch = []
         for n in notes:
             batch.append({
                 "id": n['id']['note_id'], 
-                "parent_id": n.get('parent_record_id'), # Might be None in global view
+                "parent_id": n.get('parent_record_id'), 
                 "type": "note",
                 "title": f"Note: {n.get('title', 'Untitled')}",
                 "content": n.get('content_plaintext', ''),
                 "url": f"https://app.attio.com/w/workspace/note/{n['id']['note_id']}",
                 "metadata": {"created_at": n.get("created_at")}
             })
-            if len(batch) >= 100:
-                upsert_batch(batch)
-                batch = []
-        upsert_batch(batch)
+        
+        safe_upsert(batch, batch_size=50) # Use safe upsert
         NOTES_ALREADY_SYNCED = True
     else:
-        print("   🔸 Fast Sync failed (API requires filtering). Switching to Slow Mode for Notes.")
+        print("   🔸 Global Note Sync failed (likely permissions). Will sync notes per-record later.")
 
 # --- STREAMING LOGIC ---
 def process_object_streaming(slug, singular_name):
-    """
-    Fetches records page by page and SAVES them immediately.
-    """
     limit = 1000
     offset = 0
     print(f"\n📂 Streaming {singular_name} ({slug})...")
@@ -126,11 +135,11 @@ def process_object_streaming(slug, singular_name):
         records = make_request("POST", f"objects/{slug}/records/query", payload=payload)
         
         if not records:
-            break # End of data
+            break 
             
-        print(f"   📥 Downloaded records {offset} to {offset + len(records)}...")
+        print(f"   📥 Downloaded {len(records)} records (Offset: {offset})...")
 
-        # 2. Process & Save Records IMMEDIATELY
+        # 2. Process Records
         record_batch = []
         for rec in records:
             try:
@@ -152,19 +161,17 @@ def process_object_streaming(slug, singular_name):
                 })
             except: pass
         
-        # Save Records now
-        upsert_batch(record_batch)
+        # Save Records (Batch 50)
+        safe_upsert(record_batch, batch_size=50)
 
         # 3. Fetch Notes/Comments (SLOW PATH)
-        # Only do this if Fast Sync failed OR if we need comments (comments are always local)
         if not NOTES_ALREADY_SYNCED:
-            print(f"   🐢 Slow-Syncing notes for this batch...")
             note_batch = []
-            for i, rec in enumerate(records):
+            for rec in records:
                 try:
                     rec_id = rec['id']['record_id']
                     
-                    # Fetch Notes (Safe filtering)
+                    # Notes
                     notes = make_request("GET", "notes", params={"parent_record_id": rec_id, "parent_object": slug})
                     if notes:
                         for n in notes:
@@ -176,7 +183,7 @@ def process_object_streaming(slug, singular_name):
                                 "metadata": {"created_at": n.get("created_at")}
                             })
                     
-                    # Fetch Comments (Always needed as they aren't "Notes")
+                    # Comments
                     comments = make_request("GET", f"objects/{slug}/records/{rec_id}/comments")
                     if comments:
                         for c in comments:
@@ -189,10 +196,12 @@ def process_object_streaming(slug, singular_name):
                             })
                 except: pass
             
-            # Save the notes for this page
-            upsert_batch(note_batch)
+            # Save notes (Batch 50)
+            if note_batch:
+                print(f"   📝 Saving {len(note_batch)} notes/comments...")
+                safe_upsert(note_batch, batch_size=50)
 
-        # Move to next page
+        # Next Page
         if len(records) < limit:
             break
         offset += limit
@@ -200,19 +209,11 @@ def process_object_streaming(slug, singular_name):
 # --- MAIN SYNC ---
 def sync_everything():
     
-    # 1. LISTS
-    print("--- 1. Syncing Lists ---")
-    lists = make_request("GET", "lists") or []
-    list_items = []
-    for l in lists:
-        list_items.append({
-            "id": l['id']['list_id'], "type": "list", "title": l['name'], 
-            "content": "", "url": "", "metadata": {}
-        })
-    upsert_batch(list_items)
+    # 1. NOTES (FIRST!!)
+    sync_notes_first()
 
     # 2. TASKS
-    print("--- 2. Syncing Tasks ---")
+    print("\n--- Syncing Tasks ---")
     tasks = make_request("GET", "tasks") or []
     task_items = []
     for t in tasks:
@@ -223,15 +224,22 @@ def sync_everything():
             "url": "https://app.attio.com/w/workspace/tasks",
             "metadata": {"deadline": t.get("deadline_at")}
         })
-    upsert_batch(task_items)
+    safe_upsert(task_items, batch_size=50)
 
-    # 3. TRY FAST NOTES
-    try_global_notes_sync()
+    # 3. LISTS
+    print("\n--- Syncing Lists ---")
+    lists = make_request("GET", "lists") or []
+    list_items = []
+    for l in lists:
+        list_items.append({
+            "id": l['id']['list_id'], "type": "list", "title": l['name'], 
+            "content": "", "url": "", "metadata": {}
+        })
+    safe_upsert(list_items, batch_size=50)
 
-    # 4. OBJECTS & RECORDS
-    print("\n--- 3. Syncing Objects ---")
+    # 4. OBJECTS
+    print("\n--- Syncing Objects ---")
     objects = make_request("GET", "objects") or []
-    
     for obj in objects:
         slug = obj['api_slug']
         singular = obj['singular_noun']
