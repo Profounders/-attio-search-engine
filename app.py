@@ -23,16 +23,16 @@ if not supabase:
 # --- SEARCH INTERFACE ---
 st.title("🔍 Search Attio")
 
-# Simple, big search bar (Label hidden for clean look)
 query = st.text_input("Search", placeholder="Search people, companies, notes, tasks...", label_visibility="collapsed")
 
 if query:
     try:
-        # 1. Run Global Search (Limit to top 50 matches for speed)
+        # --- THE FIX IS HERE ---
+        # 1. Limit first, then Search.
         response = supabase.table("attio_index") \
             .select("*") \
-            .text_search("fts", query) \
             .limit(50) \
+            .text_search("fts", query) \
             .execute()
         
         results = response.data
@@ -44,7 +44,7 @@ if query:
             st.caption(f"Found {len(results)} matches")
             
             for item in results:
-                # Assign Icons based on type
+                # Assign Icons
                 t = item.get('type', 'unknown')
                 icon = "📄"
                 if t == 'person': icon = "👤"
@@ -54,7 +54,6 @@ if query:
                 elif t == 'comment': icon = "💬"
                 elif t in ['call', 'meeting', 'call_recording']: icon = "📞"
 
-                # Render Result Card
                 with st.container():
                     # Title & Link
                     url = item.get('url', '#')
@@ -64,7 +63,6 @@ if query:
                     
                     # Content Snippet
                     content = item.get('content') or ""
-                    # Clean up raw dictionary strings if they look messy
                     if content.startswith("{'"): 
                         content = "Record Data match" 
                     
