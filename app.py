@@ -5,6 +5,29 @@ from supabase import create_client
 st.set_page_config(page_title="Attio Search", layout="wide")
 st.title("🔍 Attio Search Engine")
 
+# ... imports ...
+st.title("🔍 Attio Search Engine")
+
+# --- DEBUG SECTION ---
+try:
+    # Get a simple count of all rows
+    response = supabase.table("attio_index").select("id", count="exact").execute()
+    total_count = response.count
+    st.metric(label="Total Records in Database", value=total_count)
+    
+    if total_count > 0:
+        # Show the most recent 3 items to verify data quality
+        st.caption("Most recent updates:")
+        recent = supabase.table("attio_index").select("title, type, created_at").order("created_at", desc=True).limit(3).execute()
+        st.table(recent.data)
+    else:
+        st.error("The database is empty. The Sync Script ran, but uploaded 0 items.")
+except Exception as e:
+    st.error(f"Database Check Failed: {e}")
+# --- END DEBUG ---
+
+# ... rest of your code ...
+
 # Connect DB
 @st.cache_resource
 def init_connection():
