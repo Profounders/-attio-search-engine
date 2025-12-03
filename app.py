@@ -12,7 +12,11 @@ def init_connection():
     key = st.secrets["SUPABASE_KEY"]
     return create_client(url, key)
 
-supabase = init_connection()
+try:
+    supabase = init_connection()
+except Exception as e:
+    st.error(f"Could not connect to database. Check Secrets. Error: {e}")
+    st.stop()
 
 # Sidebar
 st.sidebar.title("Filters")
@@ -22,8 +26,8 @@ type_filter = st.sidebar.multiselect(
     default=["person", "company", "note"]
 )
 
-# Search
-query = st.text_input("Search...", placeholder="Type query here")
+# Search Input
+query = st.text_input("Search...", placeholder="Type query here (e.g. 'Project Alpha')")
 
 if query:
     # 1. Start the query builder
@@ -37,26 +41,32 @@ if query:
     req = req.text_search("fts", query)
         
     # 4. Execute
-    results = req.execute().data
-    
-    st.markdown(f"**Found {len(results)} results**")
-    
-    for item in results:
-        # ... rest of the code is fine ...
-    st.markdown(f"**Found {len(results)} results**")
-    
-    for item in results:
-        with st.container():
-            emoji = "📄"
-            if item['type'] == 'person': emoji = "👤"
-            if item['type'] == 'company': emoji = "🏢"
-            if item['type'] == 'call_recording': emoji = "📞"
-            if item['type'] == 'task': emoji = "✅"
-            
-            st.subheader(f"{emoji} {item['title']}")
-            st.markdown(f"**Type:** {item['type']} | [View in Attio]({item['url']})")
-            
-            # Show preview of content
-            preview = item['content'][:300] + "..." if len(item['content']) > 300 else item['content']
-            st.info(preview)
-            st.divider()
+    try:
+        results = req.execute().data
+        
+        st.markdown(f"**Found {len(results)} results**")
+        
+        # 5. Display Results (Indented correctly now)
+        for item in results:
+            with st.container():
+                emoji = "📄"
+                if item['type'] == 'person': emoji = "👤"
+                if item['type'] == 'company': emoji = "🏢"
+                if item['type'] == 'call_recording': emoji = "📞"
+                if item['type'] == 'task': emoji = "✅"
+                if item['type'] == 'note': emoji = "📝"
+                
+                # Title and Link
+                st.subheader(f"{emoji} {item['title']}")
+                url = item.get('url', '#')
+                st.markdown(f"**Type:** {item['type'].upper()} | [View in Attio]({url})")
+                
+                # Content Preview (Handle None values safely)
+                content = item.get('content') or ""
+                preview = content[:300] + "..." if len(content) > 300 else content
+                st.info(preview)
+                
+                st.divider()
+
+    except Exception as e:
+        st.error(f"Search failed: {e}")
