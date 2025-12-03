@@ -1,6 +1,5 @@
 import os
 import time
-import json
 import requests
 from supabase import create_client, Client
 
@@ -9,27 +8,40 @@ ATTIO_API_KEY = os.environ.get("ATTIO_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-# Check if secrets are loaded
-if not ATTIO_API_KEY or not SUPABASE_URL:
-    print("❌ Error: Secrets not found. Please check GitHub Actions Secrets.")
+# --- DEBUG CHECKS (Run before connecting) ---
+print(f"DEBUG: Checking credentials...")
+
+if not SUPABASE_URL:
+    print("❌ Error: SUPABASE_URL is missing/empty.")
     exit(1)
 
-supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+if not SUPABASE_URL.startswith("https://"):
+    print(f"❌ Error: SUPABASE_URL is invalid. It must start with 'https://'. Current value starts with: {SUPABASE_URL[:4]}...")
+    exit(1)
 
+if not SUPABASE_KEY:
+    print("❌ Error: SUPABASE_KEY is missing.")
+    exit(1)
+
+# Now it is safe to connect
+try:
+    supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+except Exception as e:
+    print(f"❌ Critical Error: Could not connect to Supabase. Reason: {e}")
+    exit(1)
+
+
+# --- API HELPER ---
 def attio_get(endpoint, params=None):
     url = f"https://api.attio.com/v2/{endpoint}"
     headers = {"Authorization": f"Bearer {ATTIO_API_KEY}", "Accept": "application/json"}
     try:
-        time.sleep(0.2) # Increased sleep to prevent Rate Limits (429)
+        # Simple rate limit prevention
+        time.sleep(0.2) 
         response = requests.get(url, headers=headers, params=params)
         
-        if response.status_code == 429:
-            print(f"⚠️ Rate limit hit on {endpoint}. Waiting 5 seconds...")
-            time.sleep(5)
-            return attio_get(endpoint, params) # Retry
-            
         if response.status_code != 200:
-            print(f"⚠️ Warning: {endpoint} returned {response.status_code} - {response.text}")
+            print(f"⚠️ Warning: {endpoint} returned {response.status_code}")
             return []
             
         return response.json().get("data", [])
@@ -37,81 +49,65 @@ def attio_get(endpoint, params=None):
         print(f"❌ Error fetching {endpoint}: {e}")
         return []
 
+# --- MAIN SYNC ---
 def upsert_item(data):
     try:
-        # Convert Metadata to string if it's too complex, ensuring JSON compatibility
-        if "metadata" in data and isinstance(data["metadata"], dict):
-            # Clean metadata to remove nulls or complex objects Supabase might reject
-            data["metadata"] = {k: v for k, v in data["metadata"].items() if v is not None}
-            
-        supabase.table("attio_index").upsert(data).execute()
-        print(f"✅ Synced: {data['title'][:30]}")
-    except Exception as e:
-        print(f"❌ Database Error on {data.get('title')}: {e}")
-
-# --- HELPER: Safely find a name ---
-def get_safe_name(values):
-    """Tries multiple ways to find a name/title in a record"""
-    try:
-        # Try standard slugs
-        if 'name' in values and values['name']: return values['name'][0]['value']
-        if 'title' in values and values['title']: return values['title'][0]['value']
-        if 'email_addresses' in values and values['email_addresses']: return values['email_addresses'][0]['value']
-        if 'domains' in values and values['domains']: return values['domains'][0]['value']
+        # Clean metadata (Supabase hates nulls in JSONB sometimes)
+        if "metadata" in data and data["metadata"]:
+             data["metadata"] = {k: v for k, v in data["metadata"].items() if v is not None}
         
-        # Fallback: Just take the first available text value
-        for key, val in values.items():
-            if isinstance(val, list) and len(val) > 0 and 'value' in val[0]:
-                return val[0]['value']
-                
-        return "Untitled Record"
-    except:
-        return "Unknown"
+        supabase.table("attio_index").upsert(data).execute()
+        print(f"✅ Synced: {data['title'][:40]}")
+    except Exception as e:
+        print(f"❌ DB Error on {data.get('title')}: {e}")
 
-# --- SYNC FUNCTIONS ---
 def sync_everything():
     print("🚀 Starting Sync...")
 
     # 1. LISTS
     lists = attio_get("lists")
     for l in lists:
-        try:
-            upsert_item({
-                "id": l['id']['list_id'],
-                "type": "list",
-                "title": f"List: {l['name']}",
-                "content": f"Workspace list {l.get('api_slug')}",
-                "url": f"https://app.attio.com/w/workspace/lists/{l['id']['list_id']}",
-                "metadata": {}
-            })
-        except Exception as e:
-            print(f"⚠️ Skipped List {l.get('name')}: {e}")
+        upsert_item({
+            "id": l['id']['list_id'],
+            "type": "list",
+            "title": f"List: {l['name']}",
+            "content": f"Workspace list {l.get('api_slug')}",
+            "url": f"https://app.attio.com/w/workspace/lists/{l['id']['list_id']}",
+            "metadata": {}
+        })
 
-    # 2. OBJECTS & RECORDS
+    # 2. OBJECTS
     objects = attio_get("objects")
     for obj in objects:
         slug = obj['api_slug']
         print(f"📂 Processing Object: {slug}...")
         
-        records = attio_get(f"objects/{slug}/records", params={"limit": 100}) # Lower limit for safety
+        # Fetch records
+        records = attio_get(f"objects/{slug}/records", params={"limit": 100})
         
         for rec in records:
             try:
                 rec_id = rec['id']['record_id']
                 vals = rec.get('values', {})
-                name = get_safe_name(vals)
+                
+                # Try to find a name
+                name = "Untitled"
+                # Check common name fields
+                for k in ['name', 'title', 'email_addresses', 'domain']:
+                    if k in vals and vals[k]:
+                        name = vals[k][0]['value']
+                        break
 
-                # Sync Record
                 upsert_item({
                     "id": rec_id,
                     "type": slug,
                     "title": name,
                     "content": str(vals),
                     "url": f"https://app.attio.com/w/workspace/record/{slug}/{rec_id}",
-                    "metadata": {} # Keep metadata empty to reduce complexity errors for now
+                    "metadata": {}
                 })
-
-                # Sync Notes (V2)
+                
+                # Fetch Notes for this record
                 notes = attio_get("notes", params={"parent_record_id": rec_id})
                 for n in notes:
                     upsert_item({
@@ -123,25 +119,10 @@ def sync_everything():
                         "url": f"https://app.attio.com/w/workspace/note/{n['id']['note_id']}",
                         "metadata": {}
                     })
-                
-                # Sync Tasks
-                tasks = attio_get(f"objects/{slug}/records/{rec_id}/tasks")
-                for t in tasks:
-                    upsert_item({
-                        "id": t['id']['task_id'],
-                        "parent_id": rec_id,
-                        "type": "task",
-                        "title": f"Task: {t.get('content_plaintext', 'Untitled')}",
-                        "content": f"Completed: {t.get('is_completed')}",
-                        "url": "https://app.attio.com/w/workspace/tasks",
-                        "metadata": {}
-                    })
 
             except Exception as e:
-                print(f"⚠️ Failed to process record {rec.get('id', 'unknown')}: {e}")
-                continue # Skip this record, move to next
-
-    print("🏁 Sync Complete.")
+                print(f"Skipping broken record: {e}")
+                continue
 
 if __name__ == "__main__":
     sync_everything()
