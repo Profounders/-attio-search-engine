@@ -26,14 +26,23 @@ type_filter = st.sidebar.multiselect(
 query = st.text_input("Search...", placeholder="Type query here")
 
 if query:
-    # Run Search
-    req = supabase.table("attio_index").select("*").text_search("fts", query)
+    # 1. Start the query builder
+    req = supabase.table("attio_index").select("*")
     
+    # 2. Apply Filters FIRST (Chain safer)
     if type_filter:
         req = req.in_("type", type_filter)
+    
+    # 3. Apply Search LAST
+    req = req.text_search("fts", query)
         
+    # 4. Execute
     results = req.execute().data
     
+    st.markdown(f"**Found {len(results)} results**")
+    
+    for item in results:
+        # ... rest of the code is fine ...
     st.markdown(f"**Found {len(results)} results**")
     
     for item in results:
