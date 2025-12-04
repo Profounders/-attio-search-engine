@@ -8,36 +8,24 @@ st.set_page_config(page_title="Attio Search", page_icon="🔍", layout="centered
 # --- CUSTOM CSS ---
 st.markdown("""
 <style>
-    /* Spacing tweaks */
     .block-container { padding-top: 2rem; }
     hr { margin-top: 0.5rem; margin-bottom: 0.5rem; opacity: 0.2; }
-    
-    /* Link styling */
     a { text-decoration: none; color: #007bff !important; }
     a:hover { text-decoration: underline; }
-    
-    /* Snippet text style */
     .snippet-text { font-size: 14px; color: #333; line-height: 1.5; margin-bottom: 8px; }
-    
-    /* Hide the default label for the multiselect */
     div[data-testid="stMultiSelect"] label { display: none; }
-
-    /* --- GREEN TAGS CSS --- */
+    
+    /* Green Tags */
     .stMultiSelect span[data-baseweb="tag"] {
         background-color: #d1e7dd !important; 
         border: 1px solid #a3cfbb !important; 
     }
-    .stMultiSelect span[data-baseweb="tag"] span {
-        color: #0a3622 !important; 
-    }
-    .stMultiSelect span[data-baseweb="tag"] svg {
-        fill: #0a3622 !important; 
-        color: #0a3622 !important;
-    }
+    .stMultiSelect span[data-baseweb="tag"] span { color: #0a3622 !important; }
+    .stMultiSelect span[data-baseweb="tag"] svg { fill: #0a3622 !important; color: #0a3622 !important; }
 </style>
 """, unsafe_allow_html=True)
 
-# --- DATABASE CONNECTION ---
+# --- DATABASE ---
 @st.cache_resource
 def init_connection():
     try:
@@ -50,17 +38,27 @@ def init_connection():
 supabase = init_connection()
 
 if not supabase:
-    st.error("❌ Could not connect to Supabase. Check Secrets.")
+    st.error("❌ Supabase Error. Check Secrets.")
     st.stop()
 
 # --- HELPER: SNIPPET GENERATOR ---
 def get_context_snippet(text, query, window=200):
     if not text: return ""
-    text = " ".join(text.split()) # Clean whitespace
+    text = " ".join(text.split())
     
+    # Clean query for regex highlighting (remove special search syntax like " - or)
+    clean_query = re.sub(r'[^\w\s]', '', query).strip()
+    words = clean_query.split()
+    
+    # Try to find the first matching word from the query
     flags = re.IGNORECASE
-    match = re.search(re.escape(query), text, flags)
+    match = None
     
+    for word in words:
+        if len(word) > 2: # Ignore small words
+            match = re.search(re.escape(word), text, flags)
+            if match: break
+            
     if match:
         start_idx = match.start()
         end_idx = match.end()
@@ -71,38 +69,38 @@ def get_context_snippet(text, query, window=200):
         if start_cut > 0: snippet = "..." + snippet
         if end_cut < len(text): snippet = snippet + "..."
         
-        # Highlight term
-        snippet = re.sub(f"({re.escape(query)})", r"**\1**", snippet, flags=re.IGNORECASE)
+        # Highlight all query terms
+        for word in words:
+            if len(word) > 2:
+                snippet = re.sub(f"({re.escape(word)})", r"**\1**", snippet, flags=re.IGNORECASE)
         return snippet
     else:
         return text[:(window*2)] + "..."
 
-# --- UI START ---
+# --- UI ---
 st.title("🔍 Search Attio")
 
 # 1. SEARCH BAR
-query = st.text_input("Search", placeholder="Type keywords...", label_visibility="collapsed")
+query = st.text_input("Search", placeholder='Try "Client Name" -draft ...', label_visibility="collapsed")
+st.caption("Tip: Use quotes for \"exact phrases\", minus for -exclusion, and OR for multiple options.")
 
-# 2. FILTER TOGGLES (Added call_recording)
-available_types = ["person", "company", "note", "task", "call_recording", "comment", "list"]
-
-selected_types = st.multiselect(
-    "Filter Types", 
-    options=available_types, 
-    default=available_types,
-    help="Remove tags to hide specific data types."
-)
+# 2. FILTERS
+available_types = ["person", "company", "note", "task", "call_recording", "comment", "list", "email"]
+selected_types = st.multiselect("Filter Types", options=available_types, default=available_types)
 
 if query:
     if not selected_types:
-        st.warning("⚠️ Please select at least one data type to search.")
+        st.warning("⚠️ Select at least one filter.")
     else:
         try:
-            # 3. BUILD QUERY
+            # 3. BUILD QUERY (WEBSEARCH ENABLED)
             req = supabase.table("attio_index").select("*")
-            req = req.in_("type", selected_types) # Filter
-            req = req.limit(100) # Limit
-            req = req.text_search("fts", query) # Search
+            req = req.in_("type", selected_types)
+            req = req.limit(100)
+            
+            # --- THE MAGIC CHANGE ---
+            # 'type': 'websearch' enables Google-like syntax
+            req = req.text_search("fts", query, options={"type": "websearch", "config": "english"})
             
             results = req.execute().data
 
@@ -114,19 +112,19 @@ if query:
                 for item in results:
                     t = item.get('type', 'unknown')
                     
-                    # Icons
                     icon = "📄"
                     if t == 'person': icon = "👤"
                     elif t == 'company': icon = "🏢"
                     elif t == 'note': icon = "📝"
                     elif t == 'task': icon = "✅"
                     elif t == 'comment': icon = "💬"
-                    elif t == 'call_recording': icon = "📞" # New Icon
+                    elif t == 'call_recording': icon = "📞"
+                    elif t == 'email': icon = "📧"
 
                     with st.container():
-                        # Title
                         url = item.get('url', '#')
                         title = item.get('title') or "Untitled"
+                        
                         st.markdown(
                             f"""
                             <div style="font-size: 18px; font-weight: 600; margin-bottom: 2px;">
@@ -136,15 +134,16 @@ if query:
                             unsafe_allow_html=True
                         )
                         
-                        # Metadata
                         meta_info = t.upper()
                         if item.get("metadata") and item["metadata"].get("created_at"):
                             date_str = item["metadata"]["created_at"][:10]
                             meta_info += f" • {date_str}"
                         st.caption(meta_info)
 
-                        # Content Snippet
                         content = item.get('content') or ""
+                        
+                        # Snippet generation might fail if query has symbols like " - 
+                        # so we use the helper that cleans them first
                         snippet = get_context_snippet(content, query, window=200)
 
                         if content.startswith("{'") or content.startswith('{"'):
@@ -152,15 +151,11 @@ if query:
                         else:
                              st.markdown(f'<div class="snippet-text">{snippet}</div>', unsafe_allow_html=True)
 
-                        # Full Content Expander
                         with st.expander("View Full Content", expanded=False):
                             if content.startswith("{'") or content.startswith('{"'):
                                  st.code(content, language="json")
                             else:
-                                 st.markdown(
-                                    f"""<div style="font-size: 14px; white-space: pre-wrap;">{content}</div>""", 
-                                    unsafe_allow_html=True
-                                 )
+                                 st.markdown(f"""<div style="font-size: 14px; white-space: pre-wrap;">{content}</div>""", unsafe_allow_html=True)
                         
                         st.divider()
 
