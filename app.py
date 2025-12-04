@@ -19,8 +19,27 @@ st.markdown("""
     /* Snippet text style */
     .snippet-text { font-size: 14px; color: #333; line-height: 1.5; margin-bottom: 8px; }
     
-    /* Hide the default label for the multiselect to make it look integrated */
+    /* Hide the default label for the multiselect */
     div[data-testid="stMultiSelect"] label { display: none; }
+
+    /* --- GREEN TAGS CSS --- */
+    
+    /* 1. Target the Tag Background & Border */
+    .stMultiSelect span[data-baseweb="tag"] {
+        background-color: #d1e7dd !important; /* Light Green Background */
+        border: 1px solid #a3cfbb !important; /* Green Border */
+    }
+
+    /* 2. Target the Text inside the tag */
+    .stMultiSelect span[data-baseweb="tag"] span {
+        color: #0a3622 !important; /* Dark Green Text */
+    }
+
+    /* 3. Target the 'X' icon */
+    .stMultiSelect span[data-baseweb="tag"] svg {
+        fill: #0a3622 !important; /* Dark Green Icon */
+        color: #0a3622 !important;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -70,11 +89,9 @@ st.title("🔍 Search Attio")
 # 1. SEARCH BAR
 query = st.text_input("Search", placeholder="Type keywords...", label_visibility="collapsed")
 
-# 2. FILTER TOGGLES (Multiselect)
-# We define the available types
+# 2. FILTER TOGGLES (Green Tags)
 available_types = ["person", "company", "note", "task", "comment", "list"]
 
-# Display the multiselect (Default = All Selected)
 selected_types = st.multiselect(
     "Filter Types", 
     options=available_types, 
@@ -88,21 +105,12 @@ if query:
     else:
         try:
             # 3. BUILD QUERY
-            # Start with the table
             req = supabase.table("attio_index").select("*")
+            req = req.in_("type", selected_types) # Filter
+            req = req.limit(100) # Limit
+            req = req.text_search("fts", query) # Search
             
-            # Apply Filters (Must be done using .in_)
-            req = req.in_("type", selected_types)
-            
-            # Apply Limit (Fixes library error if done before search)
-            req = req.limit(100)
-            
-            # Apply Search
-            req = req.text_search("fts", query)
-            
-            # Execute
-            response = req.execute()
-            results = response.data
+            results = req.execute().data
 
             if not results:
                 st.warning(f"No results found for '{query}'")
