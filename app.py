@@ -4,16 +4,16 @@ from supabase import create_client
 # --- PAGE CONFIG ---
 st.set_page_config(page_title="Attio Search", page_icon="🔍", layout="centered")
 
-# --- CUSTOM CSS FOR COMPACT RESULTS ---
+# --- CUSTOM CSS ---
 st.markdown("""
 <style>
     /* Make the divider lines subtle */
     hr { margin-top: 0.5rem; margin-bottom: 0.5rem; opacity: 0.2; }
-    /* Tighten container spacing */
-    .block-container { padding-top: 2rem; }
     /* Link styling */
     a { text-decoration: none; color: #007bff !important; }
     a:hover { text-decoration: underline; }
+    /* Expander styling to make it subtle */
+    .streamlit-expanderHeader { font-size: 14px; color: #555; }
 </style>
 """, unsafe_allow_html=True)
 
@@ -40,11 +40,10 @@ query = st.text_input("Search", placeholder="Search people, companies, notes..."
 
 if query:
     try:
-        # 1. LIMIT INCREASED TO 500
-        # Note: We apply limit() BEFORE text_search() to prevent library errors.
+        # 1. SEARCH QUERY
         response = supabase.table("attio_index") \
             .select("*") \
-            .limit(500) \
+            .limit(100) \
             .text_search("fts", query) \
             .execute()
         
@@ -64,10 +63,9 @@ if query:
                 elif t == 'note': icon = "📝"
                 elif t == 'task': icon = "✅"
                 elif t == 'comment': icon = "💬"
-                elif t in ['call', 'meeting', 'call_recording']: icon = "📞"
 
                 with st.container():
-                    # --- 1. TITLE (18px Bold Link) ---
+                    # --- 1. TITLE (Clickable Link) ---
                     url = item.get('url', '#')
                     title = item.get('title') or "Untitled"
                     
@@ -80,33 +78,39 @@ if query:
                         unsafe_allow_html=True
                     )
                     
-                    # --- 2. METADATA (Small Caption) ---
+                    # --- 2. METADATA ---
                     meta_info = t.upper()
                     if item.get("metadata") and item["metadata"].get("created_at"):
-                        date_str = item["metadata"]["created_at"][:10] # Grab YYYY-MM-DD
+                        date_str = item["metadata"]["created_at"][:10]
                         meta_info += f" • {date_str}"
                     
                     st.caption(meta_info)
 
-                    # --- 3. CONTENT (14px Readable Body) ---
+                    # --- 3. FULL CONTENT (Inside Expander) ---
                     content = item.get('content') or ""
                     
-                    # Clean up raw data dumps
+                    # Clean up raw data dumps for display
                     if content.startswith("{'") or content.startswith('{"'):
-                        content = "Record details matched."
-                    
-                    # Truncate to 300 chars
-                    if len(content) > 300:
-                        content = content[:300] + "..."
-                    
-                    st.markdown(
-                        f"""
-                        <div style="font-size: 14px; line-height: 1.5; color: inherit; opacity: 0.9;">
-                            {content}
-                        </div>
-                        """, 
-                        unsafe_allow_html=True
-                    )
+                        display_text = "Record Data (Click to view raw details)"
+                        is_raw = True
+                    else:
+                        display_text = "View Content"
+                        is_raw = False
+
+                    # Create the dropdown
+                    with st.expander(display_text, expanded=False):
+                        # Use HTML to keep the text readable and styled
+                        if is_raw:
+                            st.code(content, language="json")
+                        else:
+                            st.markdown(
+                                f"""
+                                <div style="font-size: 14px; line-height: 1.6; white-space: pre-wrap;">
+                                    {content}
+                                </div>
+                                """, 
+                                unsafe_allow_html=True
+                            )
                     
                     st.divider()
 
