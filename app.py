@@ -23,21 +23,15 @@ st.markdown("""
     div[data-testid="stMultiSelect"] label { display: none; }
 
     /* --- GREEN TAGS CSS --- */
-    
-    /* 1. Target the Tag Background & Border */
     .stMultiSelect span[data-baseweb="tag"] {
-        background-color: #d1e7dd !important; /* Light Green Background */
-        border: 1px solid #a3cfbb !important; /* Green Border */
+        background-color: #d1e7dd !important; 
+        border: 1px solid #a3cfbb !important; 
     }
-
-    /* 2. Target the Text inside the tag */
     .stMultiSelect span[data-baseweb="tag"] span {
-        color: #0a3622 !important; /* Dark Green Text */
+        color: #0a3622 !important; 
     }
-
-    /* 3. Target the 'X' icon */
     .stMultiSelect span[data-baseweb="tag"] svg {
-        fill: #0a3622 !important; /* Dark Green Icon */
+        fill: #0a3622 !important; 
         color: #0a3622 !important;
     }
 </style>
@@ -89,8 +83,8 @@ st.title("🔍 Search Attio")
 # 1. SEARCH BAR
 query = st.text_input("Search", placeholder="Type keywords...", label_visibility="collapsed")
 
-# 2. FILTER TOGGLES (Green Tags)
-available_types = ["person", "company", "note", "task", "comment", "list"]
+# 2. FILTER TOGGLES (Added call_recording)
+available_types = ["person", "company", "note", "task", "call_recording", "comment", "list"]
 
 selected_types = st.multiselect(
     "Filter Types", 
@@ -127,6 +121,7 @@ if query:
                     elif t == 'note': icon = "📝"
                     elif t == 'task': icon = "✅"
                     elif t == 'comment': icon = "💬"
+                    elif t == 'call_recording': icon = "📞" # New Icon
 
                     with st.container():
                         # Title
