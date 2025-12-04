@@ -31,7 +31,7 @@ if query:
         # 1. Limit first, then Search.
         response = supabase.table("attio_index") \
             .select("*") \
-            .limit(50) \
+            .limit(500) \
             .text_search("fts", query) \
             .execute()
         
