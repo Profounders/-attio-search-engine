@@ -10,7 +10,7 @@ ATTIO_API_KEY = os.environ.get("ATTIO_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-print("🚀 Starting Sync V27 (Meeting/Transcript Probe)...")
+print("🚀 Starting Sync V28 (The Complete Picture)...")
 
 if not ATTIO_API_KEY or not SUPABASE_URL:
     print("❌ Error: Secrets missing.")
@@ -29,118 +29,178 @@ def safe_upsert(items):
         for item in items:
             if "metadata" in item and isinstance(item["metadata"], dict):
                 item["metadata"] = {k: v for k, v in item["metadata"].items() if v is not None}
+        
         supabase.table("attio_index").upsert(items).execute()
         print(f"   💾 Saved batch of {len(items)}.")
     except Exception as e:
         print(f"   ❌ DB Error: {e}")
 
-# --- TRANSCRIPT HUNTER ---
-def sync_transcripts_v27():
-    print("\n📞 1. Hunting for Transcripts...")
+# --- HELPER: NAME EXTRACTOR ---
+def extract_smart_name_and_content(vals):
+    name = "Untitled"
+    email = ""
+    try:
+        for key in ['name', 'full_name', 'first_name', 'title', 'company_name']:
+            if key in vals and vals[key]:
+                item = vals[key][0]
+                if 'value' in item: name = item['value']
+                elif 'first_name' in item: name = f"{item.get('first_name', '')} {item.get('last_name', '')}"
+                break
+        
+        if 'email_addresses' in vals and vals['email_addresses']:
+            email = vals['email_addresses'][0].get('value', '')
+        
+        if name == "Untitled" and email: name = email
+        content = f"Name: {name} | Email: {email}"
+    except:
+        content = "Error parsing"
+    return name, content
+
+# --- 1. SYNC GLOBAL MEETINGS & TRANSCRIPTS (NEW!) ---
+def sync_meetings_global():
+    print("\n📞 1. Syncing Global Meetings & Transcripts...")
+    url = "https://api.attio.com/v2/meetings"
     headers = {"Authorization": f"Bearer {ATTIO_API_KEY}", "Accept": "application/json"}
     
-    # --- STRATEGY A: Direct Global List (The "Easy Way") ---
-    # We test if Attio allows listing all meetings globally
-    print("   🔎 Attempting Strategy A: Global Meeting List...")
-    try:
-        url = "https://api.attio.com/v2/meetings" # Guessing this exists like /v2/notes
-        res = requests.get(url, headers=headers)
-        
-        if res.status_code == 200:
-            print("      ✅ Success! Global Meeting endpoint found.")
-            meetings = res.json().get("data", [])
-            process_meetings(meetings)
-            return # We are done if this worked
-        else:
-            print(f"      🔸 Strategy A failed (Status {res.status_code}). Endpoint likely doesn't exist.")
-    except: pass
-
-    # --- STRATEGY B: The "Calendar Crawl" (The "Hard Way") ---
-    # We iterate through People to find their meetings
-    print("   🔎 Attempting Strategy B: Scanning People for associated meetings...")
-    
-    limit = 200 # Scan batches of people
+    limit = 200
     offset = 0
-    total_scanned = 0
+    total_transcripts = 0
     
     while True:
         try:
-            # Get People
-            res = requests.post("https://api.attio.com/v2/objects/people/records/query", 
-                                headers=headers, json={"limit": limit, "offset": offset})
-            people = res.json().get("data", [])
-            if not people: break
+            params = {"limit": limit, "offset": offset}
+            res = requests.get(url, headers=headers, params=params, timeout=60)
             
-            print(f"      - Scanning batch of {len(people)} people for meeting history...")
-            
-            for p in people:
-                pid = p['id']['record_id']
-                
-                # Check for Meetings attached to this person
-                # Note: Attio V2 usually links meetings via the 'calendar_events' or similar endpoint
-                # We try the most common pattern: GET /v2/objects/people/records/{id}/meetings
-                m_res = requests.get(f"https://api.attio.com/v2/objects/people/records/{pid}/meetings", headers=headers)
-                
-                if m_res.status_code == 200:
-                    meetings = m_res.json().get("data", [])
-                    if meetings:
-                        print(f"         Found {len(meetings)} meetings for person {pid}")
-                        process_meetings(meetings)
-            
-            if len(people) < limit: break
-            offset += limit
-            total_scanned += len(people)
-            
-            # Safety break to prevent running forever if it's not finding anything
-            if total_scanned > 2000:
-                print("      ⚠️ Scanned 2000 people and found no meetings. Stopping Transcript hunt.")
+            if res.status_code != 200:
+                print(f"   ❌ API Error {res.status_code} fetching meetings")
                 break
                 
+            meetings = res.json().get("data", [])
+            if not meetings: break
+            
+            print(f"   ...Processing batch of {len(meetings)} meetings...")
+            
+            transcript_batch = []
+            
+            for m in meetings:
+                # 1. Safe ID Extraction
+                # Try 'meeting_id' first, fall back to 'record_id'
+                mid = m['id'].get('meeting_id') or m['id'].get('record_id')
+                
+                # Title
+                title = m.get('title', 'Untitled Meeting')
+                
+                # 2. Get Recordings
+                rec_url = f"https://api.attio.com/v2/meetings/{mid}/call_recordings"
+                rec_res = requests.get(rec_url, headers=headers)
+                recordings = rec_res.json().get("data", [])
+                
+                if not recordings:
+                    continue # No recording = No transcript
+                
+                for rec in recordings:
+                    rid = rec['id']['call_recording_id']
+                    
+                    # 3. Get Transcript
+                    trans_url = f"https://api.attio.com/v2/meetings/{mid}/call_recordings/{rid}/transcript"
+                    trans_res = requests.get(trans_url, headers=headers)
+                    
+                    if trans_res.status_code == 200:
+                        t_data = trans_res.json()
+                        
+                        # Try multiple keys for text
+                        text = t_data.get("content_plaintext", "")
+                        if not text: text = t_data.get("subtitles", "")
+                        if not text: text = t_data.get("text", "")
+                        
+                        if text:
+                            print(f"      ✅ Transcript Found: {title}")
+                            transcript_batch.append({
+                                "id": rid,
+                                "parent_id": mid,
+                                "type": "call_recording",
+                                "title": f"Transcript: {title}",
+                                "content": text, # The heavy text
+                                "url": f"https://app.attio.com", # Generic link as deep links vary
+                                "metadata": {"meeting_id": mid, "duration": rec.get("duration")}
+                            })
+                            total_transcripts += 1
+            
+            # Save Transcripts (Small chunks)
+            if transcript_batch:
+                safe_upsert(transcript_batch)
+                
+            if len(meetings) < limit: break
+            offset += limit
+            
         except Exception as e:
-            print(f"      ❌ Scan Error: {e}")
+            print(f"   ⚠️ Meeting Sync Error: {e}")
             break
+            
+    print(f"   ✅ Total Transcripts Synced: {total_transcripts}")
 
-def process_meetings(meetings):
-    """
-    Takes a list of meeting objects, finds recordings, gets transcripts, saves to DB.
-    """
+# --- 2. GLOBAL NOTES ---
+def sync_notes_global():
+    print("\n📝 2. Syncing Notes...")
+    url = "https://api.attio.com/v2/notes"
     headers = {"Authorization": f"Bearer {ATTIO_API_KEY}", "Accept": "application/json"}
-    
-    for m in meetings:
+    limit = 1000
+    offset = 0
+    while True:
         try:
-            mid = m['id']['meeting_id'] # ID structure depends on endpoint
-            title = m.get('title', 'Untitled Meeting')
+            res = requests.get(url, headers=headers, params={"limit": limit, "offset": offset}, timeout=60)
+            data = res.json().get("data", [])
+            if not data: break
             
-            # 1. Get Recordings
-            rec_res = requests.get(f"https://api.attio.com/v2/meetings/{mid}/call_recordings", headers=headers)
-            recordings = rec_res.json().get("data", [])
-            
-            for rec in recordings:
-                rid = rec['id']['call_recording_id']
-                
-                # 2. Get Transcript
-                trans_res = requests.get(f"https://api.attio.com/v2/meetings/{mid}/call_recordings/{rid}/transcript", headers=headers)
-                
-                if trans_res.status_code == 200:
-                    text = trans_res.json().get("content_plaintext", "")
-                    if text:
-                        print(f"         ✅ SAVING TRANSCRIPT: {title}")
-                        safe_upsert([{
-                            "id": rid,
-                            "type": "call_recording",
-                            "title": f"Transcript: {title}",
-                            "content": text,
-                            "url": f"https://app.attio.com", # Deep links to meetings are tricky without slug
-                            "metadata": {"meeting_id": mid}
-                        }])
-        except: pass
+            batch = []
+            for n in data:
+                batch.append({
+                    "id": n['id']['note_id'], 
+                    "parent_id": n.get('parent_record_id'), 
+                    "type": "note",
+                    "title": f"Note: {n.get('title', 'Untitled')}",
+                    "content": n.get('content_plaintext', ''), 
+                    "url": f"https://app.attio.com/w/workspace/note/{n['id']['note_id']}",
+                    "metadata": {"created_at": n.get("created_at")}
+                })
+            safe_upsert(batch)
+            if len(data) < limit: break
+            offset += limit
+        except: break
 
-# --- STANDARD SYNC (Keep your existing working logic) ---
-def sync_standard_items():
-    print("\n📦 2. Syncing Standard Items (People/Companies/Notes)...")
-    # ... (I excluded the full code for brevity, but assume your existing logic runs here) ...
-    # For now, let's just focus on the transcripts to debug.
+# --- 3. PEOPLE & COMPANIES ---
+def sync_entities():
+    print("\n👤 3. Syncing People & Companies...")
+    for slug in ["people", "companies"]:
+        offset = 0
+        while True:
+            try:
+                res = requests.post(f"https://api.attio.com/v2/objects/{slug}/records/query", 
+                                    headers={"Authorization": f"Bearer {ATTIO_API_KEY}"}, 
+                                    json={"limit": 1000, "offset": offset})
+                data = res.json().get("data", [])
+                if not data: break
+                
+                batch = []
+                for rec in data:
+                    rec_id = rec['id']['record_id']
+                    name, content = extract_smart_name_and_content(rec.get('values', {}))
+                    batch.append({
+                        "id": rec_id, "type": slug, "title": name, "content": content,
+                        "url": f"https://app.attio.com/w/workspace/record/{slug}/{rec_id}", "metadata": {}
+                    })
+                safe_upsert(batch)
+                if len(data) < 1000: break
+                offset += 1000
+            except: break
 
 if __name__ == "__main__":
-    sync_transcripts_v27()
-    print("\n🏁 Transcript Probe Complete.")
+    try:
+        sync_meetings_global() # Runs FIRST
+        sync_notes_global()
+        sync_entities()
+        print("\n🏁 Sync Job Finished.")
+    except Exception as e:
+        print("\n❌ CRITICAL FAILURE")
+        traceback.print_exc()
+        exit(1)
