@@ -12,10 +12,20 @@ st.markdown("""
     hr { margin-top: 0.5rem; margin-bottom: 0.5rem; opacity: 0.2; }
     a { text-decoration: none; color: #007bff !important; }
     a:hover { text-decoration: underline; }
-    .snippet-text { font-size: 14px; color: #333; line-height: 1.5; margin-bottom: 8px; }
     
+    /* Snippet Text Style */
+    .snippet-text { 
+        font-size: 14px; 
+        color: #333; 
+        line-height: 1.6; 
+        margin-bottom: 8px; 
+        font-family: sans-serif;
+    }
+    
+    /* Hide the default label for the multiselect */
     div[data-testid="stMultiSelect"] label { display: none; }
     
+    /* Green Tags */
     .stMultiSelect span[data-baseweb="tag"] {
         background-color: #d1e7dd !important; 
         border: 1px solid #a3cfbb !important; 
@@ -63,8 +73,9 @@ def get_context_snippet(text, query, window=200):
                 break
     
     # 3. If no exact match, try "ROOT" Match (Stemming Logic)
+    # This handles Education -> Educational, etc.
     if not match:
-        suffixes = ['ation', 'tion', 'sion', 'ment', 'ing', 'ed', 'es', 's', 'al']
+        suffixes = ['ation', 'tional', 'tion', 'sion', 'ment', 'ing', 'ed', 'es', 's', 'al']
         for word in words:
             if len(word) > 4: 
                 root = word
@@ -88,17 +99,16 @@ def get_context_snippet(text, query, window=200):
         if start_cut > 0: snippet = "..." + snippet
         if end_cut < len(text): snippet = snippet + "..."
         
-        # --- HIGHLIGHT LOGIC ---
+        # --- HIGHLIGHT LOGIC (HTML) ---
         highlight_terms = [re.escape(w) for w in words if len(w) > 1]
         if matched_word and matched_word not in words:
             highlight_terms.append(re.escape(matched_word))
             
-        # Regex pattern
+        # Regex pattern: Matches the term PLUS any following letters (e.g. Educ -> Educational)
         pattern = "|".join(highlight_terms)
         
-        # CHANGE: Use HTML span with Yellow Background instead of Markdown bold
-        # We enforce color: black to ensure it is readable in Dark Mode
-        highlight_style = "background-color: #ffd700; color: black; padding: 0 4px; border-radius: 3px; font-weight: bold;"
+        # Style: Yellow Background, Black Text (High Contrast)
+        highlight_style = "background-color: #ffd700; color: black; padding: 0 4px; border-radius: 3px; font-weight: bold; box-shadow: 0 1px 2px rgba(0,0,0,0.1);"
         
         snippet = re.sub(
             f"({pattern}\w*)", 
@@ -194,14 +204,14 @@ if query:
                     # 3. Content
                     content = item.get('content') or ""
                     
-                    # Generate Snippet (Cleaned query)
+                    # Generate Snippet
                     clean_query = re.sub(r'[^\w\s]', '', query).strip() 
                     snippet = get_context_snippet(content, clean_query, window=200)
 
                     if content.startswith("{'") or content.startswith('{"'):
                             st.info("Match found in Record Metadata")
                     else:
-                            # Display Snippet with Yellow Highlight
+                            # Render Snippet with HTML (Yellow Highlight)
                             st.markdown(f'<div class="snippet-text">{snippet}</div>', unsafe_allow_html=True)
 
                     with st.expander("View Full Content", expanded=False):
