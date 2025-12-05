@@ -5,22 +5,47 @@ import traceback
 import json
 from supabase import create_client, Client
 
+# --- IMMEDIATE ALIVENESS CHECK ---
+print("------------------------------------------------", flush=True)
+print("✅ SCRIPT IS ALIVE. V33 (Gold Standard) Starting...", flush=True)
+print("------------------------------------------------", flush=True)
+
 # --- CONFIG ---
 ATTIO_API_KEY = os.environ.get("ATTIO_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-print("🚀 Starting Sync V29 (Context & Title Fixer)...")
-
 if not ATTIO_API_KEY or not SUPABASE_URL:
-    print("❌ Error: Secrets missing.")
+    print("❌ Error: Secrets missing.", flush=True)
     exit(1)
 
 try:
     supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+    print("   🔌 DB Connected.", flush=True)
 except Exception as e:
-    print(f"❌ Supabase Connection Error: {e}")
+    print(f"   ❌ DB Connection Failed: {e}", flush=True)
     exit(1)
+
+# --- GLOBAL CACHE (For Speed) ---
+NAME_CACHE = {}
+
+# --- API HELPER ---
+def make_request(method, url, params=None, json_data=None):
+    headers = {"Authorization": f"Bearer {ATTIO_API_KEY}", "Accept": "application/json"}
+    try:
+        if method == "GET":
+            res = requests.get(url, headers=headers, params=params, timeout=30)
+        else:
+            res = requests.post(url, headers=headers, json=json_data, timeout=30)
+        
+        if res.status_code == 429:
+            print("   ⚠️ Rate Limit. Sleeping 5s...", flush=True)
+            time.sleep(5)
+            return make_request(method, url, params, json_data)
+            
+        return res
+    except:
+        return None
 
 # --- DB HELPER ---
 def safe_upsert(items):
@@ -29,217 +54,198 @@ def safe_upsert(items):
         for item in items:
             if "metadata" in item and isinstance(item["metadata"], dict):
                 item["metadata"] = {k: v for k, v in item["metadata"].items() if v is not None}
-        
         supabase.table("attio_index").upsert(items).execute()
-        print(f"   💾 Saved batch of {len(items)}.")
+        print(f"   💾 Saved batch of {len(items)} items.", flush=True)
     except Exception as e:
-        print(f"   ❌ DB Error: {e}")
+        print(f"   ❌ DB Error: {e}", flush=True)
 
-# --- HELPER: SMART NAME EXTRACTOR ---
-def extract_smart_name_and_content(vals):
-    name = "Untitled"
-    email = ""
+# --- HELPER: CACHED PARENT LOOKUP ---
+def get_parent_name(object_slug, record_id):
+    if not record_id: return "Unknown"
+    cache_key = f"{object_slug}:{record_id}"
+    if cache_key in NAME_CACHE: return NAME_CACHE[cache_key]
+
     try:
-        # Priority scan for names
-        for key in ['name', 'full_name', 'first_name', 'title', 'company_name', 'deal_name']:
+        url = f"https://api.attio.com/v2/objects/{object_slug}/records/{record_id}"
+        res = make_request("GET", url)
+        if not res or res.status_code != 200: return "Unknown"
+        
+        vals = res.json().get("data", {}).get("values", {})
+        name = "Unknown"
+        
+        for key in ['name', 'full_name', 'title', 'company_name']:
             if key in vals and vals[key]:
-                item = vals[key][0]
-                if 'value' in item: name = item['value']
-                elif 'first_name' in item: name = f"{item.get('first_name', '')} {item.get('last_name', '')}"
+                name = vals[key][0]['value']
                 break
         
-        if 'email_addresses' in vals and vals['email_addresses']:
-            email = vals['email_addresses'][0].get('value', '')
+        if name == "Unknown" and 'email_addresses' in vals:
+             if vals['email_addresses']: name = vals['email_addresses'][0]['value']
         
-        if name == "Untitled" and email: name = email
-        content = f"Name: {name} | Email: {email}"
+        NAME_CACHE[cache_key] = name
+        return name
     except:
-        content = "Error parsing"
-    return name, content
+        return "Unknown"
 
-# --- 1. SYNC NOTES WITH CONTEXT (THE FIX) ---
-def sync_enriched_notes():
-    print("\n📝 1. Syncing Notes with Rich Titles...")
+# --- 1. SYNC NOTES (CACHED SPEED) ---
+def sync_notes_cached():
+    print("\n📝 1. Syncing Notes (Cached Mode)...", flush=True)
+    targets = ["people", "companies", "deals"]
     
-    # We scan the objects where notes usually live to get the Parent Name
-    target_slugs = ["people", "companies", "deals"] 
-    headers = {"Authorization": f"Bearer {ATTIO_API_KEY}", "Accept": "application/json"}
-    
-    for slug in target_slugs:
-        print(f"\n   🔎 Scanning {slug} to fix note titles...")
-        
-        limit = 500
+    for slug in targets:
+        print(f"   🔎 Scanning {slug} for notes...", flush=True)
+        limit = 1000
         offset = 0
         
         while True:
-            # A. Get Records (People/Companies)
-            payload = {"limit": limit, "offset": offset}
-            try:
-                res = requests.post(f"https://api.attio.com/v2/objects/{slug}/records/query", 
-                                    headers=headers, json=payload)
-                
-                # If object doesn't exist (e.g. deals), skip
-                if res.status_code == 404: break
-                
-                records = res.json().get("data", [])
-                if not records: break
-                
-                note_batch = []
-                
-                for rec in records:
-                    rec_id = rec['id']['record_id']
+            params = {"limit": limit, "offset": offset, "parent_object": slug}
+            res = make_request("GET", "https://api.attio.com/v2/notes", params=params)
+            
+            if not res or res.status_code != 200: break
+            data = res.json().get("data", [])
+            if not data: break
+            
+            batch = []
+            for n in data:
+                try:
+                    nid = n['id']['note_id']
+                    pid = n.get('parent_record_id')
                     
-                    # B. Get the REAL Name (e.g., "Acme Corp")
-                    parent_name, _ = extract_smart_name_and_content(rec.get('values', {}))
+                    # FAST LOOKUP
+                    pname = get_parent_name(slug, pid)
                     
-                    # C. Fetch Notes for this specific record
-                    n_res = requests.get("https://api.attio.com/v2/notes", headers=headers,
-                                         params={"parent_record_id": rec_id, "parent_object": slug})
-                    notes = n_res.json().get("data", [])
+                    raw_title = n.get('title', 'Untitled')
+                    if not raw_title or raw_title == "Untitled":
+                        final_title = f"Note on {pname}"
+                    else:
+                        final_title = f"Note: {raw_title} ({pname})"
                     
-                    for n in notes:
-                        # D. Construct Better Title
-                        # Original note title (e.g. "Meeting Minutes")
-                        raw_title = n.get('title', 'Untitled')
-                        
-                        # New Rich Title: "Note: Meeting Minutes - Acme Corp"
-                        if raw_title == "Untitled" or raw_title == "":
-                            final_title = f"Note on {parent_name}"
-                        else:
-                            final_title = f"Note: {raw_title} ({parent_name})"
+                    batch.append({
+                        "id": nid, "parent_id": pid, "type": "note",
+                        "title": final_title,
+                        "content": n.get('content_plaintext', ''),
+                        "url": f"https://app.attio.com/w/workspace/note/{nid}",
+                        "metadata": {"created_at": n.get("created_at"), "parent": pname}
+                    })
+                except: pass
+            
+            safe_upsert(batch)
+            if len(data) < limit: break
+            offset += limit
 
-                        note_batch.append({
-                            "id": n['id']['note_id'], 
-                            "parent_id": rec_id, 
-                            "type": "note",
-                            "title": final_title, # <--- FIXED TITLE
-                            "content": n.get('content_plaintext', ''), 
-                            "url": f"https://app.attio.com/w/workspace/note/{n['id']['note_id']}",
-                            "metadata": {"created_at": n.get("created_at"), "parent": parent_name}
-                        })
-                
-                # Save batch
-                if note_batch:
-                    safe_upsert(note_batch)
-                    print(f"      -> Updated {len(note_batch)} notes for {slug}")
-
-                if len(records) < limit: break
-                offset += limit
-                
-            except Exception as e:
-                print(f"   ⚠️ Error in loop: {e}")
-                break
-
-# --- 2. TRANSCRIPTS (Keep existing logic) ---
+# --- 2. TRANSCRIPTS (ROBUST V28 LOGIC) ---
 def sync_transcripts():
-    print("\n📞 2. Syncing Meeting Transcripts...")
-    # (Same logic as V28 - Auto Detect Meeting Object)
-    headers = {"Authorization": f"Bearer {ATTIO_API_KEY}", "Accept": "application/json"}
-    
-    # 1. Find Meeting Object
-    slug = "meetings" # Default
-    try:
-        obj_check = requests.get("https://api.attio.com/v2/objects", headers=headers).json().get("data", [])
-        slugs = [o['api_slug'] for o in obj_check]
-        if "meetings" not in slugs:
-            if "calls" in slugs: slug = "calls"
-            elif "sales_calls" in slugs: slug = "sales_calls"
-    except: pass
-    
+    print("\n📞 2. Syncing Transcripts (Robust Mode)...", flush=True)
     limit = 200
     offset = 0
+    total_found = 0
+    
     while True:
-        try:
-            res = requests.post(f"https://api.attio.com/v2/objects/{slug}/records/query", 
-                                headers=headers, json={"limit": limit, "offset": offset})
-            if res.status_code == 404: break
-            meetings = res.json().get("data", [])
-            if not meetings: break
-            
-            trans_batch = []
-            for m in meetings:
-                # Safe ID extraction
+        # Use Global Endpoint
+        res = make_request("GET", "https://api.attio.com/v2/meetings", params={"limit": limit, "offset": offset})
+        if not res: break
+        meetings = res.json().get("data", [])
+        if not meetings: break
+        
+        batch = []
+        for m in meetings:
+            try:
+                # 1. IDs
                 mid = m['id'].get('meeting_id') or m['id'].get('record_id')
                 
-                # Get Title
+                # 2. Title
                 title = "Untitled Meeting"
                 if 'title' in m['values']: title = m['values']['title'][0]['value']
                 elif 'name' in m['values']: title = m['values']['name'][0]['value']
                 
-                # Get Recordings
-                rec_res = requests.get(f"https://api.attio.com/v2/meetings/{mid}/call_recordings", headers=headers)
-                recs = rec_res.json().get("data", [])
+                # 3. Recordings
+                r_res = make_request("GET", f"https://api.attio.com/v2/meetings/{mid}/call_recordings")
+                if not r_res: continue
                 
-                for r in recs:
+                for r in r_res.json().get("data", []):
                     rid = r['id']['call_recording_id']
-                    t_res = requests.get(f"https://api.attio.com/v2/meetings/{mid}/call_recordings/{rid}/transcript", headers=headers)
-                    if t_res.status_code == 200:
-                        txt = t_res.json().get("content_plaintext", "") or t_res.json().get("text", "")
+                    
+                    # 4. Transcript (The Fallback Logic)
+                    t_res = make_request("GET", f"https://api.attio.com/v2/meetings/{mid}/call_recordings/{rid}/transcript")
+                    
+                    if t_res and t_res.status_code == 200:
+                        data = t_res.json()
+                        
+                        # Try multiple fields (V28 Logic)
+                        txt = data.get("content_plaintext", "")
+                        if not txt: txt = data.get("subtitles", "")
+                        if not txt: txt = data.get("text", "")
+                        
                         if txt:
-                            trans_batch.append({
-                                "id": rid, "parent_id": mid, "type": "call_recording",
-                                "title": f"Transcript: {title}", # Good title
-                                "content": txt,
-                                "url": f"https://app.attio.com",
-                                "metadata": {"meeting_id": mid}
+                            print(f"      ✅ Transcript Found: {title}", flush=True)
+                            batch.append({
+                                "id": rid, "type": "call_recording",
+                                "title": f"Transcript: {title}", "content": txt,
+                                "url": "https://app.attio.com", "metadata": {"meeting_id": mid}
                             })
-            safe_upsert(trans_batch)
-            if len(meetings) < limit: break
-            offset += limit
-        except: break
+                            total_found += 1
+            except: pass
+            
+        safe_upsert(batch)
+        if len(meetings) < limit: break
+        offset += limit
+    
+    print(f"   🏁 Total Transcripts Synced: {total_found}", flush=True)
 
-# --- 3. ENTITIES (Keep existing logic) ---
-def sync_entities():
-    print("\n👤 3. Syncing People & Companies...")
+# --- 3. PEOPLE/COMPANIES ---
+def sync_standard():
+    print("\n📦 3. Syncing People & Companies...", flush=True)
     for slug in ["people", "companies"]:
+        limit = 1000
         offset = 0
         while True:
-            try:
-                res = requests.post(f"https://api.attio.com/v2/objects/{slug}/records/query", 
-                                    headers={"Authorization": f"Bearer {ATTIO_API_KEY}"}, 
-                                    json={"limit": 1000, "offset": offset})
-                data = res.json().get("data", [])
-                if not data: break
-                
-                batch = []
-                for rec in data:
-                    rec_id = rec['id']['record_id']
-                    name, content = extract_smart_name_and_content(rec.get('values', {}))
+            url = f"https://api.attio.com/v2/objects/{slug}/records/query"
+            res = make_request("POST", url, json_data={"limit": limit, "offset": offset})
+            if not res: break
+            data = res.json().get("data", [])
+            if not data: break
+            
+            batch = []
+            for d in data:
+                try:
+                    rid = d['id']['record_id']
+                    name = "Untitled"
+                    vals = d.get('values', {})
+                    if 'name' in vals and vals['name']: name = vals['name'][0]['value']
+                    elif 'company_name' in vals: name = vals['company_name'][0]['value']
+                    elif 'email_addresses' in vals: name = vals['email_addresses'][0]['value']
+                    
                     batch.append({
-                        "id": rec_id, "type": slug, "title": name, "content": content,
-                        "url": f"https://app.attio.com/w/workspace/record/{slug}/{rec_id}", "metadata": {}
+                        "id": rid, "type": slug, "title": name, "content": str(vals),
+                        "url": f"https://app.attio.com/w/workspace/record/{slug}/{rid}", "metadata": {}
                     })
-                safe_upsert(batch)
-                if len(data) < 1000: break
-                offset += 1000
-            except: break
+                except: pass
+            safe_upsert(batch)
+            if len(data) < limit: break
+            offset += limit
 
 # --- 4. TASKS ---
 def sync_tasks():
-    print("\n✅ 4. Syncing Tasks...")
-    try:
-        res = requests.get("https://api.attio.com/v2/tasks", headers={"Authorization": f"Bearer {ATTIO_API_KEY}"})
-        tasks = res.json().get("data", [])
-        batch = []
-        for t in tasks:
-            batch.append({
-                "id": t['id']['task_id'], "type": "task", 
-                "title": f"Task: {t.get('content_plaintext', 'Untitled')}",
-                "content": f"Status: {t.get('is_completed')}",
-                "url": "https://app.attio.com/w/workspace/tasks", "metadata": {}
-            })
-        safe_upsert(batch)
-    except: pass
+    print("\n✅ 4. Syncing Tasks...", flush=True)
+    res = make_request("GET", "https://api.attio.com/v2/tasks")
+    if not res: return
+    batch = []
+    for t in res.json().get("data", []):
+        batch.append({
+            "id": t['id']['task_id'], "type": "task", 
+            "title": f"Task: {t.get('content_plaintext', 'Untitled')}",
+            "content": f"Status: {t.get('is_completed')}",
+            "url": "https://app.attio.com/w/workspace/tasks", "metadata": {}
+        })
+    safe_upsert(batch)
 
 if __name__ == "__main__":
     try:
-        # Run Enriched Notes first to fix the titles
-        sync_enriched_notes()
-        sync_transcripts()
-        sync_entities()
+        sync_notes_cached()
+        sync_transcripts() # Now using the robust V28 logic
+        sync_standard()
         sync_tasks()
-        print("\n🏁 Sync Job Finished.")
+        print("\n🏁 Sync Job Finished.", flush=True)
     except Exception as e:
-        print("\n❌ CRITICAL FAILURE")
+        print(f"\n❌ CRITICAL: {e}", flush=True)
         traceback.print_exc()
         exit(1)
