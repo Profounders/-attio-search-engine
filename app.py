@@ -14,10 +14,8 @@ st.markdown("""
     a:hover { text-decoration: underline; }
     .snippet-text { font-size: 14px; color: #333; line-height: 1.5; margin-bottom: 8px; }
     
-    /* Hide the default label for the multiselect */
     div[data-testid="stMultiSelect"] label { display: none; }
     
-    /* Green Tags */
     .stMultiSelect span[data-baseweb="tag"] {
         background-color: #d1e7dd !important; 
         border: 1px solid #a3cfbb !important; 
@@ -43,41 +41,68 @@ if not supabase:
     st.error("❌ Could not connect to Supabase. Check Secrets.")
     st.stop()
 
-# --- HELPER: SNIPPET GENERATOR ---
+# --- HELPER: SMART SNIPPET GENERATOR ---
 def get_context_snippet(text, query, window=200):
     if not text: return ""
     text = " ".join(text.split())
     
-    # Clean query for regex highlighting
+    # 1. Clean query
     clean_query = re.sub(r'[^\w\s]', '', query).strip()
     words = clean_query.split()
     
-    # Try to find the first matching word from the query
     flags = re.IGNORECASE
     match = None
-    
+    matched_word = ""
+
+    # 2. Try EXACT Match first
     for word in words:
-        if len(word) > 1: # Ignore single letters
+        if len(word) > 1:
             match = re.search(re.escape(word), text, flags)
-            if match: break
-            
+            if match: 
+                matched_word = word
+                break
+    
+    # 3. If no exact match, try "ROOT" Match (Stemming Logic)
+    # This handles Education -> Educated, Running -> Run, etc.
+    if not match:
+        suffixes = ['ation', 'tion', 'sion', 'ment', 'ing', 'ed', 'es', 's', 'al']
+        for word in words:
+            if len(word) > 4: # Only stem longer words
+                root = word
+                for suffix in suffixes:
+                    if root.endswith(suffix):
+                        root = root[:-len(suffix)]
+                        break
+                # Try finding the root
+                if len(root) >= 3:
+                    match = re.search(re.escape(root), text, flags)
+                    if match:
+                        matched_word = root
+                        break
+
     if match:
         start_idx = match.start()
         end_idx = match.end()
         start_cut = max(0, start_idx - window)
-        # This was the line that caused the error:
         end_cut = min(len(text), end_idx + window)
         
         snippet = text[start_cut:end_cut]
         if start_cut > 0: snippet = "..." + snippet
         if end_cut < len(text): snippet = snippet + "..."
         
-        # Highlight all query terms
-        for word in words:
-            if len(word) > 1:
-                snippet = re.sub(f"({re.escape(word)})", r"**\1**", snippet, flags=re.IGNORECASE)
+        # Highlight: Bold the exact matches found in the snippet
+        # We try to highlight both the exact query AND the root if applicable
+        highlight_terms = [re.escape(w) for w in words if len(w) > 1]
+        if matched_word and matched_word not in words:
+            highlight_terms.append(re.escape(matched_word)) # Add the root stem
+            
+        # Regex to highlight any of the terms found
+        pattern = "|".join(highlight_terms)
+        snippet = re.sub(f"({pattern}\w*)", r"**\1**", snippet, flags=re.IGNORECASE)
+        
         return snippet
     else:
+        # Fallback: Just show top of text
         return text[:(window*2)] + "..."
 
 # --- UI START ---
@@ -163,7 +188,7 @@ if query:
                     # 3. Content
                     content = item.get('content') or ""
                     
-                    # Generate Snippet
+                    # Generate Snippet (Cleaned query)
                     clean_query = re.sub(r'[^\w\s]', '', query).strip() 
                     snippet = get_context_snippet(content, clean_query, window=200)
 
