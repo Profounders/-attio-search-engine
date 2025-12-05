@@ -41,7 +41,7 @@ if not supabase:
     st.error("❌ Could not connect to Supabase. Check Secrets.")
     st.stop()
 
-# --- HELPER: SMART SNIPPET GENERATOR ---
+# --- HELPER: SMART SNIPPET GENERATOR (YELLOW HIGHLIGHT) ---
 def get_context_snippet(text, query, window=200):
     if not text: return ""
     text = " ".join(text.split())
@@ -63,17 +63,15 @@ def get_context_snippet(text, query, window=200):
                 break
     
     # 3. If no exact match, try "ROOT" Match (Stemming Logic)
-    # This handles Education -> Educated, Running -> Run, etc.
     if not match:
         suffixes = ['ation', 'tion', 'sion', 'ment', 'ing', 'ed', 'es', 's', 'al']
         for word in words:
-            if len(word) > 4: # Only stem longer words
+            if len(word) > 4: 
                 root = word
                 for suffix in suffixes:
                     if root.endswith(suffix):
                         root = root[:-len(suffix)]
                         break
-                # Try finding the root
                 if len(root) >= 3:
                     match = re.search(re.escape(root), text, flags)
                     if match:
@@ -90,19 +88,27 @@ def get_context_snippet(text, query, window=200):
         if start_cut > 0: snippet = "..." + snippet
         if end_cut < len(text): snippet = snippet + "..."
         
-        # Highlight: Bold the exact matches found in the snippet
-        # We try to highlight both the exact query AND the root if applicable
+        # --- HIGHLIGHT LOGIC ---
         highlight_terms = [re.escape(w) for w in words if len(w) > 1]
         if matched_word and matched_word not in words:
-            highlight_terms.append(re.escape(matched_word)) # Add the root stem
+            highlight_terms.append(re.escape(matched_word))
             
-        # Regex to highlight any of the terms found
+        # Regex pattern
         pattern = "|".join(highlight_terms)
-        snippet = re.sub(f"({pattern}\w*)", r"**\1**", snippet, flags=re.IGNORECASE)
+        
+        # CHANGE: Use HTML span with Yellow Background instead of Markdown bold
+        # We enforce color: black to ensure it is readable in Dark Mode
+        highlight_style = "background-color: #ffd700; color: black; padding: 0 4px; border-radius: 3px; font-weight: bold;"
+        
+        snippet = re.sub(
+            f"({pattern}\w*)", 
+            fr'<span style="{highlight_style}">\1</span>', 
+            snippet, 
+            flags=re.IGNORECASE
+        )
         
         return snippet
     else:
-        # Fallback: Just show top of text
         return text[:(window*2)] + "..."
 
 # --- UI START ---
@@ -195,6 +201,7 @@ if query:
                     if content.startswith("{'") or content.startswith('{"'):
                             st.info("Match found in Record Metadata")
                     else:
+                            # Display Snippet with Yellow Highlight
                             st.markdown(f'<div class="snippet-text">{snippet}</div>', unsafe_allow_html=True)
 
                     with st.expander("View Full Content", expanded=False):
