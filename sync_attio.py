@@ -1,4 +1,4 @@
-import os
+iimport os
 import time
 import requests
 import traceback
@@ -7,7 +7,7 @@ from supabase import create_client, Client
 
 # --- IMMEDIATE ALIVENESS CHECK ---
 print("------------------------------------------------", flush=True)
-print("✅ SCRIPT IS ALIVE. V33 (Gold Standard) Starting...", flush=True)
+print("✅ SCRIPT IS ALIVE. V34 (Singular Naming Fix) Starting...", flush=True)
 print("------------------------------------------------", flush=True)
 
 # --- CONFIG ---
@@ -26,7 +26,7 @@ except Exception as e:
     print(f"   ❌ DB Connection Failed: {e}", flush=True)
     exit(1)
 
-# --- GLOBAL CACHE (For Speed) ---
+# --- GLOBAL CACHE ---
 NAME_CACHE = {}
 
 # --- API HELPER ---
@@ -86,9 +86,9 @@ def get_parent_name(object_slug, record_id):
     except:
         return "Unknown"
 
-# --- 1. SYNC NOTES (CACHED SPEED) ---
+# --- 1. SYNC NOTES ---
 def sync_notes_cached():
-    print("\n📝 1. Syncing Notes (Cached Mode)...", flush=True)
+    print("\n📝 1. Syncing Notes...", flush=True)
     targets = ["people", "companies", "deals"]
     
     for slug in targets:
@@ -109,8 +109,6 @@ def sync_notes_cached():
                 try:
                     nid = n['id']['note_id']
                     pid = n.get('parent_record_id')
-                    
-                    # FAST LOOKUP
                     pname = get_parent_name(slug, pid)
                     
                     raw_title = n.get('title', 'Untitled')
@@ -132,15 +130,12 @@ def sync_notes_cached():
             if len(data) < limit: break
             offset += limit
 
-# --- 2. TRANSCRIPTS (ROBUST V28 LOGIC) ---
+# --- 2. TRANSCRIPTS ---
 def sync_transcripts():
-    print("\n📞 2. Syncing Transcripts (Robust Mode)...", flush=True)
+    print("\n📞 2. Syncing Transcripts...", flush=True)
     limit = 200
     offset = 0
-    total_found = 0
-    
     while True:
-        # Use Global Endpoint
         res = make_request("GET", "https://api.attio.com/v2/meetings", params={"limit": limit, "offset": offset})
         if not res: break
         meetings = res.json().get("data", [])
@@ -149,52 +144,41 @@ def sync_transcripts():
         batch = []
         for m in meetings:
             try:
-                # 1. IDs
                 mid = m['id'].get('meeting_id') or m['id'].get('record_id')
-                
-                # 2. Title
                 title = "Untitled Meeting"
                 if 'title' in m['values']: title = m['values']['title'][0]['value']
                 elif 'name' in m['values']: title = m['values']['name'][0]['value']
                 
-                # 3. Recordings
                 r_res = make_request("GET", f"https://api.attio.com/v2/meetings/{mid}/call_recordings")
                 if not r_res: continue
                 
                 for r in r_res.json().get("data", []):
                     rid = r['id']['call_recording_id']
-                    
-                    # 4. Transcript (The Fallback Logic)
                     t_res = make_request("GET", f"https://api.attio.com/v2/meetings/{mid}/call_recordings/{rid}/transcript")
-                    
                     if t_res and t_res.status_code == 200:
                         data = t_res.json()
-                        
-                        # Try multiple fields (V28 Logic)
-                        txt = data.get("content_plaintext", "")
-                        if not txt: txt = data.get("subtitles", "")
-                        if not txt: txt = data.get("text", "")
-                        
+                        txt = data.get("content_plaintext") or data.get("subtitles") or data.get("text")
                         if txt:
-                            print(f"      ✅ Transcript Found: {title}", flush=True)
                             batch.append({
                                 "id": rid, "type": "call_recording",
                                 "title": f"Transcript: {title}", "content": txt,
                                 "url": "https://app.attio.com", "metadata": {"meeting_id": mid}
                             })
-                            total_found += 1
             except: pass
-            
         safe_upsert(batch)
         if len(meetings) < limit: break
         offset += limit
-    
-    print(f"   🏁 Total Transcripts Synced: {total_found}", flush=True)
 
-# --- 3. PEOPLE/COMPANIES ---
+# --- 3. PEOPLE/COMPANIES (THE FIX) ---
 def sync_standard():
     print("\n📦 3. Syncing People & Companies...", flush=True)
+    
+    # We iterate the API SLUGS (Plural)
     for slug in ["people", "companies"]:
+        
+        # We define the DB TYPE (Singular)
+        db_type = "person" if slug == "people" else "company"
+        
         limit = 1000
         offset = 0
         while True:
@@ -215,8 +199,12 @@ def sync_standard():
                     elif 'email_addresses' in vals: name = vals['email_addresses'][0]['value']
                     
                     batch.append({
-                        "id": rid, "type": slug, "title": name, "content": str(vals),
-                        "url": f"https://app.attio.com/w/workspace/record/{slug}/{rid}", "metadata": {}
+                        "id": rid, 
+                        "type": db_type, # <--- FORCING SINGULAR HERE
+                        "title": name, 
+                        "content": str(vals),
+                        "url": f"https://app.attio.com/w/workspace/record/{slug}/{rid}", 
+                        "metadata": {}
                     })
                 except: pass
             safe_upsert(batch)
@@ -241,8 +229,8 @@ def sync_tasks():
 if __name__ == "__main__":
     try:
         sync_notes_cached()
-        sync_transcripts() # Now using the robust V28 logic
-        sync_standard()
+        sync_transcripts()
+        sync_standard() # Now uses singular types
         sync_tasks()
         print("\n🏁 Sync Job Finished.", flush=True)
     except Exception as e:
