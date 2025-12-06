@@ -7,7 +7,7 @@ from supabase import create_client, Client
 
 # --- IMMEDIATE ALIVENESS CHECK ---
 print("------------------------------------------------", flush=True)
-print("✅ SCRIPT IS ALIVE. V36 (Safe Batching) Starting...", flush=True)
+print("✅ SCRIPT IS ALIVE. V37 (Fast-Forward) Starting...", flush=True)
 print("------------------------------------------------", flush=True)
 
 # --- CONFIG ---
@@ -44,7 +44,8 @@ def make_request(method, url, params=None, json_data=None):
             return make_request(method, url, params, json_data)
             
         return res
-    except:
+    except Exception as e:
+        print(f"   ❌ Network Exception: {e}", flush=True)
         return None
 
 # --- DB HELPER ---
@@ -84,49 +85,56 @@ def get_parent_name(object_slug, record_id):
     except:
         return "Unknown"
 
-# --- 1. SYNC TRANSCRIPTS (FIXED LIMITS) ---
+# --- 1. SYNC TRANSCRIPTS (FAST-FORWARD) ---
 def sync_transcripts():
     print("\n📞 1. Syncing Meeting Transcripts...", flush=True)
     
     url = "https://api.attio.com/v2/meetings"
     
-    # CHANGED: Reduced limit to 50 to prevent API rejection
-    limit = 50 
+    # Back to decent limit now that we removed the bad sort param
+    limit = 200 
     offset = 0
     total_found = 0
     
     while True:
-        # Added sort param to try and get newest first (if API supports it)
-        params = {"limit": limit, "offset": offset, "sort": "desc"}
+        # Removed 'sort' which crashed V36
+        params = {"limit": limit, "offset": offset}
         
         res = make_request("GET", url, params=params)
         
-        # Debugging Output
-        if not res: 
-            print("   ❌ Network failed completely.", flush=True)
-            break
-        if res.status_code != 200:
-            print(f"   ❌ API Rejected Request: Status {res.status_code} - {res.text}", flush=True)
+        if not res or res.status_code != 200:
+            print("   ❌ API Error or Network Fail.", flush=True)
             break
             
         meetings = res.json().get("data", [])
         if not meetings: 
-            print(f"   ℹ️ No more meetings found (Offset: {offset}).", flush=True)
+            print(f"   ℹ️ No more meetings (Offset: {offset}).", flush=True)
             break
         
-        # Log first meeting date to verify "Time Travel" status
+        # Check date of first meeting in batch
         first_date = "Unknown"
         if meetings and "start" in meetings[0]:
              first_date = meetings[0]["start"].get("datetime", "Unknown")
-        print(f"   🔎 Scanning batch {offset}-{offset+limit} (Date: {first_date})...", flush=True)
+        
+        print(f"   🔎 Batch {offset}-{offset+limit} (Date: {first_date})", flush=True)
         
         batch = []
+        skipped_old = 0
+        
         for m in meetings:
             try:
+                # --- FAST FORWARD LOGIC ---
+                # Check year. If older than 2023, SKIP checking for recordings.
+                # This makes the loop run 100x faster for old history.
+                start_dt = m.get("start", {}).get("datetime", "")
+                if start_dt and not any(y in start_dt for y in ["2023", "2024", "2025"]):
+                    skipped_old += 1
+                    continue 
+
                 mid = m['id'].get('meeting_id') or m['id'].get('record_id')
                 title = m.get('title') or m.get('subject') or "Untitled Meeting"
                 
-                # Check for Recordings
+                # Check for Recordings (Only done for recent meetings)
                 r_res = make_request("GET", f"https://api.attio.com/v2/meetings/{mid}/call_recordings")
                 if not r_res: continue
                 
@@ -134,7 +142,6 @@ def sync_transcripts():
                 
                 for r in recordings:
                     rid = r['id']['call_recording_id']
-                    # Check Transcript
                     t_res = make_request("GET", f"https://api.attio.com/v2/meetings/{mid}/call_recordings/{rid}/transcript")
                     
                     if t_res and t_res.status_code == 200:
@@ -153,6 +160,9 @@ def sync_transcripts():
                             })
                             total_found += 1
             except: pass
+        
+        if skipped_old > 0:
+            print(f"      ⏩ Skipped {skipped_old} old meetings (Pre-2023).", flush=True)
             
         safe_upsert(batch)
         
