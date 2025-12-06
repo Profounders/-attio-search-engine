@@ -10,7 +10,7 @@ ATTIO_API_KEY = os.environ.get("ATTIO_API_KEY")
 SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
-print("🚀 Starting Sync V38 (Recent-Activity Priority)...", flush=True)
+print("🚀 Starting Sync V39 (Anti-Timeout Mode)...", flush=True)
 
 if not ATTIO_API_KEY or not SUPABASE_URL:
     print("❌ Error: Secrets missing.", flush=True)
@@ -44,17 +44,40 @@ def make_request(method, url, params=None, json_data=None):
     except:
         return None
 
-# --- DB HELPER ---
+# --- DB HELPER (SMART RETRY) ---
 def safe_upsert(items):
+    """
+    Recursive retry logic:
+    If a batch fails due to timeout (57014), split it in half and try again.
+    """
     if not items: return
+    
     try:
+        # Clean metadata
         for item in items:
             if "metadata" in item and isinstance(item["metadata"], dict):
                 item["metadata"] = {k: v for k, v in item["metadata"].items() if v is not None}
+        
+        # Attempt Save
         supabase.table("attio_index").upsert(items).execute()
-        print(f"   💾 Saved batch of {len(items)} items.", flush=True)
+        print(f"   💾 Saved {len(items)} items.", flush=True)
+        
     except Exception as e:
-        print(f"   ❌ DB Error: {e}", flush=True)
+        error_str = str(e)
+        # Check for Timeout (57014) or Connection Error
+        if "57014" in error_str or "timeout" in error_str.lower() or "502" in error_str:
+            if len(items) <= 1:
+                print(f"   ❌ Failed to save single item: {error_str}", flush=True)
+                return
+            
+            # Split batch and retry
+            mid = len(items) // 2
+            print(f"   ⚠️ DB Timeout. Retrying with split batches ({mid} items)...", flush=True)
+            time.sleep(1) # Cool down
+            safe_upsert(items[:mid])
+            safe_upsert(items[mid:])
+        else:
+            print(f"   ❌ DB Error: {e}", flush=True)
 
 # --- HELPER: CACHED PARENT LOOKUP ---
 def get_parent_name(object_slug, record_id):
@@ -79,38 +102,29 @@ def get_parent_name(object_slug, record_id):
     except:
         return "Unknown"
 
-# --- 1. SMART TRANSCRIPT HUNTER (VIA ACTIVE PEOPLE) ---
+# --- 1. SMART TRANSCRIPT HUNTER ---
 def sync_transcripts_smart():
-    print("\n📞 1. Syncing Transcripts (Targeting Active People)...", flush=True)
+    print("\n📞 1. Syncing Transcripts (Scanning Active People)...", flush=True)
     
-    # We query people, sorted by Last Interaction.
-    # This brings 2025 activity to the top and ignores 2013.
     url = "https://api.attio.com/v2/objects/people/records/query"
     
-    # If 'last_interaction' isn't available in your tier, we fallback to default sort
+    # Try sorting by recent activity
     payload = {
         "limit": 100, 
-        "sort": {
-            "direction": "desc",
-            "attribute": "last_interaction_active_at" 
-        }
+        "sort": {"direction": "desc", "attribute": "last_interaction_active_at"}
     }
     
     offset = 0
     total_people_scanned = 0
-    
-    # We will scan the top 1000 active people
     MAX_PEOPLE_SCAN = 1000
+    total_transcripts = 0
     
     while total_people_scanned < MAX_PEOPLE_SCAN:
         payload["offset"] = offset
-        
-        # 1. Get Batch of Active People
         res = make_request("POST", url, json_data=payload)
         
+        # Fallback if sort isn't supported
         if not res: 
-            print("   ❌ Error fetching people query. trying fallback sort...", flush=True)
-            # Fallback: remove sort if it fails (API tier restriction)
             del payload["sort"]
             res = make_request("POST", url, json_data=payload)
             if not res: break
@@ -118,54 +132,57 @@ def sync_transcripts_smart():
         people = res.json().get("data", [])
         if not people: break
         
-        print(f"   🔎 Scanning {len(people)} active people for recent meetings...", flush=True)
+        print(f"   🔎 Scanning batch of {len(people)} active people...", flush=True)
+        
+        transcript_batch = []
         
         for p in people:
             pid = p['id']['record_id']
             
-            # 2. Get Meetings for this Person
-            # GET /v2/objects/people/records/{record_id}/meetings
+            # Check Meetings
             m_res = make_request("GET", f"https://api.attio.com/v2/objects/people/records/{pid}/meetings")
+            if not m_res: continue
             
-            if m_res and m_res.status_code == 200:
-                meetings = m_res.json().get("data", [])
+            meetings = m_res.json().get("data", [])
+            
+            for m in meetings:
+                mid = m['id'].get('meeting_id') or m['id'].get('record_id')
+                title = m.get('title', 'Untitled Meeting')
                 
-                # Check these meetings for recordings
-                transcript_batch = []
-                for m in meetings:
-                    mid = m['id'].get('meeting_id') or m['id'].get('record_id')
-                    title = m.get('title', 'Untitled Meeting')
+                # Check Recordings
+                r_res = make_request("GET", f"https://api.attio.com/v2/meetings/{mid}/call_recordings")
+                if not r_res: continue
+                
+                recordings = r_res.json().get("data", [])
+                
+                for r in recordings:
+                    rid = r['id']['call_recording_id']
+                    t_res = make_request("GET", f"https://api.attio.com/v2/meetings/{mid}/call_recordings/{rid}/transcript")
                     
-                    # 3. Check for Recordings
-                    r_res = make_request("GET", f"https://api.attio.com/v2/meetings/{mid}/call_recordings")
-                    recordings = r_res.json().get("data", []) if r_res else []
-                    
-                    for r in recordings:
-                        rid = r['id']['call_recording_id']
-                        t_res = make_request("GET", f"https://api.attio.com/v2/meetings/{mid}/call_recordings/{rid}/transcript")
+                    if t_res and t_res.status_code == 200:
+                        data = t_res.json()
+                        txt = data.get("content_plaintext") or data.get("subtitles") or data.get("text")
                         
-                        if t_res and t_res.status_code == 200:
-                            data = t_res.json()
-                            txt = data.get("content_plaintext") or data.get("subtitles") or data.get("text")
-                            
-                            if txt:
-                                print(f"      ✅ Found Transcript: {title}", flush=True)
-                                transcript_batch.append({
-                                    "id": rid, "type": "call_recording",
-                                    "title": f"Transcript: {title}", 
-                                    "content": txt,
-                                    "url": "https://app.attio.com", 
-                                    "metadata": {"meeting_id": mid}
-                                })
-                
-                safe_upsert(transcript_batch)
+                        if txt:
+                            print(f"      ✅ Found Transcript: {title}", flush=True)
+                            transcript_batch.append({
+                                "id": rid, "type": "call_recording",
+                                "title": f"Transcript: {title}", "content": txt,
+                                "url": "https://app.attio.com", "metadata": {"meeting_id": mid}
+                            })
+                            total_transcripts += 1
+                    elif t_res:
+                        # Print failure reason if not 200 OK (e.g. 403 Forbidden)
+                        if t_res.status_code not in [404, 200]:
+                             print(f"      ⚠️ Failed to get transcript for {title}: {t_res.status_code}", flush=True)
 
+        safe_upsert(transcript_batch)
         total_people_scanned += len(people)
         offset += len(people)
         
-    print("   🏁 Smart Transcript Sync Complete.", flush=True)
+    print(f"   🏁 Transcripts Complete. Found: {total_transcripts}", flush=True)
 
-# --- 2. SYNC NOTES (CACHED) ---
+# --- 2. SYNC NOTES ---
 def sync_notes_cached():
     print("\n📝 2. Syncing Notes...", flush=True)
     targets = ["people", "companies", "deals"]
@@ -203,13 +220,16 @@ def sync_notes_cached():
             if len(data) < limit: break
             offset += limit
 
-# --- 3. PEOPLE/COMPANIES ---
+# --- 3. PEOPLE/COMPANIES (ANTI-TIMEOUT) ---
 def sync_standard():
-    print("\n📦 3. Syncing People & Companies (Singular)...", flush=True)
+    print("\n📦 3. Syncing People & Companies (Small Batches)...", flush=True)
     for slug in ["people", "companies"]:
         db_type = "person" if slug == "people" else "company"
-        limit = 1000
+        
+        # REDUCED LIMIT to prevent massive JSON payloads
+        limit = 200 
         offset = 0
+        
         while True:
             url = f"https://api.attio.com/v2/objects/{slug}/records/query"
             res = make_request("POST", url, json_data={"limit": limit, "offset": offset})
@@ -232,7 +252,10 @@ def sync_standard():
                         "url": f"https://app.attio.com/w/workspace/record/{slug}/{rid}", "metadata": {}
                     })
                 except: pass
+            
+            # This calls the smart retry logic
             safe_upsert(batch)
+            
             if len(data) < limit: break
             offset += limit
 
