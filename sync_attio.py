@@ -3,12 +3,11 @@ import time
 import requests
 import traceback
 import json
-from datetime import datetime
 from supabase import create_client, Client
 
 # --- IMMEDIATE ALIVENESS CHECK ---
 print("------------------------------------------------", flush=True)
-print("✅ SCRIPT IS ALIVE. V44 (Fast-Forward Transcript) Starting...", flush=True)
+print("✅ SCRIPT IS ALIVE. V45 (Stable Core - No Transcripts) Starting...", flush=True)
 print("------------------------------------------------", flush=True)
 
 # --- CONFIG ---
@@ -27,7 +26,7 @@ except Exception as e:
     print(f"   ❌ DB Connection Failed: {e}", flush=True)
     exit(1)
 
-# --- CACHE ---
+# --- GLOBAL CACHE ---
 NAME_CACHE = {}
 
 # --- API HELPER ---
@@ -57,12 +56,11 @@ def safe_upsert(items):
                 item["metadata"] = {k: v for k, v in item["metadata"].items() if v is not None}
         
         supabase.table("attio_index").upsert(items).execute()
-        # Only print for small batches or final success to reduce noise
-        if len(items) > 0:
-             print(f"   💾 Saved {len(items)} items.", flush=True)
+        # Commented out success print to reduce log noise
+        # print(f"   💾 Saved {len(items)} items.", flush=True)
     except Exception as e:
         err = str(e)
-        if "57014" in err or "timeout" in err.lower():
+        if "57014" in err or "timeout" in err.lower() or "502" in err:
             if len(items) > 1:
                 mid = len(items) // 2
                 print("   ⚠️ DB Timeout. Splitting batch...", flush=True)
@@ -72,7 +70,7 @@ def safe_upsert(items):
         else:
             print(f"   ❌ DB Error: {e}", flush=True)
 
-# --- HELPER: PARENT LOOKUP ---
+# --- HELPER: CACHED PARENT LOOKUP ---
 def get_parent_name(object_slug, record_id):
     if not record_id: return "Unknown"
     cache_key = f"{object_slug}:{record_id}"
@@ -82,105 +80,24 @@ def get_parent_name(object_slug, record_id):
         url = f"https://api.attio.com/v2/objects/{object_slug}/records/{record_id}"
         res = make_request("GET", url)
         if not res or res.status_code != 200: return "Unknown"
+        
         vals = res.json().get("data", {}).get("values", {})
         name = "Unknown"
         for key in ['name', 'full_name', 'title', 'company_name']:
             if key in vals and vals[key]:
                 name = vals[key][0]['value']
                 break
+        if name == "Unknown" and 'email_addresses' in vals:
+             if vals['email_addresses']: name = vals['email_addresses'][0]['value']
+        
         NAME_CACHE[cache_key] = name
         return name
     except:
         return "Unknown"
 
-# --- 1. SYNC TRANSCRIPTS (FAST FORWARD) ---
-def sync_transcripts_fast_forward():
-    print("\n📞 1. Syncing Transcripts (Global Scan)...", flush=True)
-    
-    url = "https://api.attio.com/v2/meetings"
-    
-    # Batch size 100 is safe and fast enough
-    limit = 100 
-    offset = 0
-    total_found = 0
-    
-    # We only care about meetings from this year/last year
-    TARGET_YEARS = ["2024", "2025"] 
-    
-    while True:
-        res = make_request("GET", url, params={"limit": limit, "offset": offset})
-        
-        if not res or res.status_code != 200:
-            print(f"   ❌ API Error at offset {offset}: {res.status_code if res else 'Fail'}", flush=True)
-            break
-            
-        meetings = res.json().get("data", [])
-        if not meetings: 
-            print("   ℹ️ End of meeting list reached.", flush=True)
-            break
-        
-        # Check Date of first item to log progress
-        first_date = "Unknown"
-        if "start" in meetings[0]:
-             first_date = meetings[0]["start"].get("datetime", "Unknown")
-        
-        # Only print log every 1000 items to keep it clean, or if we hit target years
-        is_target_era = any(y in first_date for y in TARGET_YEARS)
-        if offset % 1000 == 0 or is_target_era:
-            print(f"   🔎 Scanning Offset {offset}... (Current Date: {first_date})", flush=True)
-        
-        batch = []
-        
-        for m in meetings:
-            try:
-                # 1. Date Check (Fast Skip)
-                m_date = m.get("start", {}).get("datetime", "")
-                if not any(y in m_date for y in TARGET_YEARS):
-                    continue # Skip old meetings instantly
-                
-                # 2. Process Recent Meeting
-                mid = m['id'].get('meeting_id') or m['id'].get('record_id')
-                title = m.get('title') or m.get('subject') or "Untitled Meeting"
-                
-                # Check for Recordings
-                r_res = make_request("GET", f"https://api.attio.com/v2/meetings/{mid}/call_recordings")
-                if not r_res: continue
-                recordings = r_res.json().get("data", [])
-                
-                for r in recordings:
-                    rid = r['id']['call_recording_id']
-                    
-                    # Check for Transcript
-                    t_res = make_request("GET", f"https://api.attio.com/v2/meetings/{mid}/call_recordings/{rid}/transcript")
-                    
-                    if t_res and t_res.status_code == 200:
-                        data = t_res.json()
-                        # Try all text fields
-                        txt = data.get("content_plaintext") or data.get("subtitles") or data.get("text")
-                        
-                        if txt:
-                            print(f"      ✅ FOUND TRANSCRIPT: {title}", flush=True)
-                            batch.append({
-                                "id": rid, 
-                                "type": "call_recording",
-                                "title": f"Transcript: {title}", 
-                                "content": str(txt),
-                                "url": "https://app.attio.com", 
-                                "metadata": {"meeting_id": mid}
-                            })
-                            total_found += 1
-            except: pass
-            
-        safe_upsert(batch)
-        
-        if len(meetings) < limit: break
-        offset += limit
-
-    print(f"   🏁 Transcripts Complete. Found: {total_found}", flush=True)
-
-# --- 2. NOTES ---
+# --- 1. SYNC NOTES (CACHED) ---
 def sync_notes_cached():
-    print("\n📝 2. Syncing Notes...", flush=True)
+    print("\n📝 1. Syncing Notes...", flush=True)
     targets = ["people", "companies", "deals"]
     for slug in targets:
         limit = 1000
@@ -215,17 +132,19 @@ def sync_notes_cached():
             safe_upsert(batch)
             if len(data) < limit: break
             offset += limit
+    print("   ✅ Notes Complete.", flush=True)
 
-# --- 3. PEOPLE/COMPANIES ---
+# --- 2. PEOPLE/COMPANIES ---
 def sync_standard():
-    print("\n📦 3. Syncing People & Companies...", flush=True)
+    print("\n📦 2. Syncing People & Companies...", flush=True)
     for slug in ["people", "companies"]:
         db_type = "person" if slug == "people" else "company"
-        limit = 500 # Safe limit
+        # Reduced limit to prevent timeouts on heavy records
+        limit = 200 
         offset = 0
         while True:
-            res = make_request("POST", f"https://api.attio.com/v2/objects/{slug}/records/query", 
-                               json_data={"limit": limit, "offset": offset})
+            url = f"https://api.attio.com/v2/objects/{slug}/records/query"
+            res = make_request("POST", url, json_data={"limit": limit, "offset": offset})
             if not res: break
             data = res.json().get("data", [])
             if not data: break
@@ -234,12 +153,11 @@ def sync_standard():
             for d in data:
                 try:
                     rid = d['id']['record_id']
-                    vals = d.get('values', {})
                     name = "Untitled"
-                    
+                    vals = d.get('values', {})
                     if 'name' in vals and vals['name']: name = vals['name'][0]['value']
-                    elif 'company_name' in vals and vals['company_name']: name = vals['company_name'][0]['value']
-                    elif 'email_addresses' in vals and vals['email_addresses']: name = vals['email_addresses'][0]['value']
+                    elif 'company_name' in vals: name = vals['company_name'][0]['value']
+                    elif 'email_addresses' in vals: name = vals['email_addresses'][0]['value']
                     
                     batch.append({
                         "id": rid, "type": db_type, "title": name, "content": str(vals),
@@ -250,10 +168,11 @@ def sync_standard():
             safe_upsert(batch)
             if len(data) < limit: break
             offset += limit
+    print("   ✅ Records Complete.", flush=True)
 
-# --- 4. TASKS ---
+# --- 3. TASKS ---
 def sync_tasks():
-    print("\n✅ 4. Syncing Tasks...", flush=True)
+    print("\n✅ 3. Syncing Tasks...", flush=True)
     res = make_request("GET", "https://api.attio.com/v2/tasks")
     if not res: return
     batch = []
@@ -265,10 +184,11 @@ def sync_tasks():
             "url": "https://app.attio.com/w/workspace/tasks", "metadata": {}
         })
     safe_upsert(batch)
+    print("   ✅ Tasks Complete.", flush=True)
 
 if __name__ == "__main__":
     try:
-        sync_transcripts_fast_forward()
+        # Transcript sync removed to restore stability
         sync_notes_cached()
         sync_standard()
         sync_tasks()
