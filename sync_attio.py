@@ -3,11 +3,12 @@ import time
 import requests
 import traceback
 import json
+from datetime import datetime
 from supabase import create_client, Client
 
 # --- IMMEDIATE ALIVENESS CHECK ---
 print("------------------------------------------------", flush=True)
-print("✅ SCRIPT IS ALIVE. V43 (Syntax Fixed) Starting...", flush=True)
+print("✅ SCRIPT IS ALIVE. V44 (Fast-Forward Transcript) Starting...", flush=True)
 print("------------------------------------------------", flush=True)
 
 # --- CONFIG ---
@@ -56,9 +57,10 @@ def safe_upsert(items):
                 item["metadata"] = {k: v for k, v in item["metadata"].items() if v is not None}
         
         supabase.table("attio_index").upsert(items).execute()
-        print(f"   💾 Saved batch of {len(items)} items.", flush=True)
+        # Only print for small batches or final success to reduce noise
+        if len(items) > 0:
+             print(f"   💾 Saved {len(items)} items.", flush=True)
     except Exception as e:
-        # Retry logic for Timeouts
         err = str(e)
         if "57014" in err or "timeout" in err.lower():
             if len(items) > 1:
@@ -80,112 +82,106 @@ def get_parent_name(object_slug, record_id):
         url = f"https://api.attio.com/v2/objects/{object_slug}/records/{record_id}"
         res = make_request("GET", url)
         if not res or res.status_code != 200: return "Unknown"
-        
         vals = res.json().get("data", {}).get("values", {})
         name = "Unknown"
-        
         for key in ['name', 'full_name', 'title', 'company_name']:
             if key in vals and vals[key]:
                 name = vals[key][0]['value']
                 break
-        
-        if name == "Unknown" and 'email_addresses' in vals:
-             if vals['email_addresses']: name = vals['email_addresses'][0]['value']
-        
         NAME_CACHE[cache_key] = name
         return name
     except:
         return "Unknown"
 
-# --- 1. SYNC TRANSCRIPTS (REVERSE SEARCH) ---
-def sync_transcripts_reverse():
-    print("\n📞 1. Syncing Transcripts (Recent Activity First)...", flush=True)
+# --- 1. SYNC TRANSCRIPTS (FAST FORWARD) ---
+def sync_transcripts_fast_forward():
+    print("\n📞 1. Syncing Transcripts (Global Scan)...", flush=True)
     
-    # We find meetings by looking at the people you talked to recently.
-    url = "https://api.attio.com/v2/objects/people/records/query"
+    url = "https://api.attio.com/v2/meetings"
     
-    # Sort by Last Interaction to get "Today's" people first
-    payload = {
-        "limit": 100, 
-        "sort": {"direction": "desc", "attribute": "last_interaction_active_at"}
-    }
-    
+    # Batch size 100 is safe and fast enough
+    limit = 100 
     offset = 0
-    MAX_SCAN = 1000 
-    total_scanned = 0
+    total_found = 0
     
-    while total_scanned < MAX_SCAN:
-        payload["offset"] = offset
+    # We only care about meetings from this year/last year
+    TARGET_YEARS = ["2024", "2025"] 
+    
+    while True:
+        res = make_request("GET", url, params={"limit": limit, "offset": offset})
         
-        # 1. Get Active People
-        res = make_request("POST", url, json_data=payload)
-        
-        # Fallback if sort isn't supported by tier
         if not res or res.status_code != 200:
-            if payload.get("sort"):
-                print("   ⚠️ Sort failed, trying default order...", flush=True)
-                del payload["sort"]
-                res = make_request("POST", url, json_data=payload)
-        
-        if not res: break
-        people = res.json().get("data", [])
-        if not people: break
-        
-        print(f"   🔎 Scanning {len(people)} active people for meetings...", flush=True)
-        
-        transcript_batch = []
-        
-        for p in people:
-            pid = p['id']['record_id']
+            print(f"   ❌ API Error at offset {offset}: {res.status_code if res else 'Fail'}", flush=True)
+            break
             
-            # 2. Get Meetings for Person
-            m_res = make_request("GET", f"https://api.attio.com/v2/objects/people/records/{pid}/meetings")
-            
-            if m_res and m_res.status_code == 200:
-                meetings = m_res.json().get("data", [])
+        meetings = res.json().get("data", [])
+        if not meetings: 
+            print("   ℹ️ End of meeting list reached.", flush=True)
+            break
+        
+        # Check Date of first item to log progress
+        first_date = "Unknown"
+        if "start" in meetings[0]:
+             first_date = meetings[0]["start"].get("datetime", "Unknown")
+        
+        # Only print log every 1000 items to keep it clean, or if we hit target years
+        is_target_era = any(y in first_date for y in TARGET_YEARS)
+        if offset % 1000 == 0 or is_target_era:
+            print(f"   🔎 Scanning Offset {offset}... (Current Date: {first_date})", flush=True)
+        
+        batch = []
+        
+        for m in meetings:
+            try:
+                # 1. Date Check (Fast Skip)
+                m_date = m.get("start", {}).get("datetime", "")
+                if not any(y in m_date for y in TARGET_YEARS):
+                    continue # Skip old meetings instantly
                 
-                for m in meetings:
-                    mid = m['id'].get('meeting_id') or m['id'].get('record_id')
-                    title = m.get('title', 'Untitled Meeting')
+                # 2. Process Recent Meeting
+                mid = m['id'].get('meeting_id') or m['id'].get('record_id')
+                title = m.get('title') or m.get('subject') or "Untitled Meeting"
+                
+                # Check for Recordings
+                r_res = make_request("GET", f"https://api.attio.com/v2/meetings/{mid}/call_recordings")
+                if not r_res: continue
+                recordings = r_res.json().get("data", [])
+                
+                for r in recordings:
+                    rid = r['id']['call_recording_id']
                     
-                    # 3. Check for Recordings
-                    r_res = make_request("GET", f"https://api.attio.com/v2/meetings/{mid}/call_recordings")
-                    if not r_res: continue
-                    recordings = r_res.json().get("data", [])
+                    # Check for Transcript
+                    t_res = make_request("GET", f"https://api.attio.com/v2/meetings/{mid}/call_recordings/{rid}/transcript")
                     
-                    for rec in recordings:
-                        rid = rec['id']['call_recording_id']
+                    if t_res and t_res.status_code == 200:
+                        data = t_res.json()
+                        # Try all text fields
+                        txt = data.get("content_plaintext") or data.get("subtitles") or data.get("text")
                         
-                        # 4. Check for Transcript
-                        t_res = make_request("GET", f"https://api.attio.com/v2/meetings/{mid}/call_recordings/{rid}/transcript")
-                        
-                        if t_res and t_res.status_code == 200:
-                            data = t_res.json()
-                            txt = data.get("content_plaintext") or data.get("subtitles") or data.get("text")
-                            
-                            if txt:
-                                print(f"      ✅ FOUND: {title}", flush=True)
-                                transcript_batch.append({
-                                    "id": rid, 
-                                    "type": "call_recording",
-                                    "title": f"Transcript: {title}", 
-                                    "content": str(txt),
-                                    "url": "https://app.attio.com", 
-                                    "metadata": {"meeting_id": mid}
-                                })
-
-        safe_upsert(transcript_batch)
+                        if txt:
+                            print(f"      ✅ FOUND TRANSCRIPT: {title}", flush=True)
+                            batch.append({
+                                "id": rid, 
+                                "type": "call_recording",
+                                "title": f"Transcript: {title}", 
+                                "content": str(txt),
+                                "url": "https://app.attio.com", 
+                                "metadata": {"meeting_id": mid}
+                            })
+                            total_found += 1
+            except: pass
+            
+        safe_upsert(batch)
         
-        total_scanned += len(people)
-        offset += len(people)
+        if len(meetings) < limit: break
+        offset += limit
 
-    print("   🏁 Transcript Sync Complete.", flush=True)
+    print(f"   🏁 Transcripts Complete. Found: {total_found}", flush=True)
 
 # --- 2. NOTES ---
 def sync_notes_cached():
     print("\n📝 2. Syncing Notes...", flush=True)
     targets = ["people", "companies", "deals"]
-    
     for slug in targets:
         limit = 1000
         offset = 0
@@ -202,7 +198,6 @@ def sync_notes_cached():
                     nid = n['id']['note_id']
                     pid = n.get('parent_record_id')
                     pname = get_parent_name(slug, pid)
-                    
                     raw_title = n.get('title', 'Untitled')
                     if not raw_title or raw_title == "Untitled":
                         final_title = f"Note on {pname}"
@@ -226,11 +221,11 @@ def sync_standard():
     print("\n📦 3. Syncing People & Companies...", flush=True)
     for slug in ["people", "companies"]:
         db_type = "person" if slug == "people" else "company"
-        limit = 500
+        limit = 500 # Safe limit
         offset = 0
         while True:
-            url = f"https://api.attio.com/v2/objects/{slug}/records/query"
-            res = make_request("POST", url, json_data={"limit": limit, "offset": offset})
+            res = make_request("POST", f"https://api.attio.com/v2/objects/{slug}/records/query", 
+                               json_data={"limit": limit, "offset": offset})
             if not res: break
             data = res.json().get("data", [])
             if not data: break
@@ -273,7 +268,7 @@ def sync_tasks():
 
 if __name__ == "__main__":
     try:
-        sync_transcripts_reverse()
+        sync_transcripts_fast_forward()
         sync_notes_cached()
         sync_standard()
         sync_tasks()
