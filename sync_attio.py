@@ -3,11 +3,12 @@ import time
 import requests
 import traceback
 import json
+from datetime import datetime
 from supabase import create_client, Client
 
 # --- IMMEDIATE ALIVENESS CHECK ---
 print("------------------------------------------------", flush=True)
-print("✅ SCRIPT IS ALIVE. V45 (Stable Core - No Transcripts) Starting...", flush=True)
+print("✅ SCRIPT IS ALIVE. V47 (Tasks + Dates Fixed) Starting...", flush=True)
 print("------------------------------------------------", flush=True)
 
 # --- CONFIG ---
@@ -47,20 +48,18 @@ def make_request(method, url, params=None, json_data=None):
     except:
         return None
 
-# --- DB HELPER (ANTI-TIMEOUT) ---
+# --- DB HELPER ---
 def safe_upsert(items):
     if not items: return
     try:
         for item in items:
             if "metadata" in item and isinstance(item["metadata"], dict):
                 item["metadata"] = {k: v for k, v in item["metadata"].items() if v is not None}
-        
         supabase.table("attio_index").upsert(items).execute()
-        # Commented out success print to reduce log noise
         # print(f"   💾 Saved {len(items)} items.", flush=True)
     except Exception as e:
         err = str(e)
-        if "57014" in err or "timeout" in err.lower() or "502" in err:
+        if "57014" in err or "timeout" in err.lower():
             if len(items) > 1:
                 mid = len(items) // 2
                 print("   ⚠️ DB Timeout. Splitting batch...", flush=True)
@@ -95,9 +94,62 @@ def get_parent_name(object_slug, record_id):
     except:
         return "Unknown"
 
-# --- 1. SYNC NOTES (CACHED) ---
+# --- 1. SYNC TRANSCRIPTS ---
+def sync_transcripts():
+    print("\n📞 1. Syncing Transcripts (With Dates)...", flush=True)
+    
+    url = "https://api.attio.com/v2/meetings"
+    limit = 100
+    offset = 0
+    TARGET_YEARS = ["2024", "2025"] 
+    
+    while True:
+        res = make_request("GET", url, params={"limit": limit, "offset": offset})
+        if not res or res.status_code != 200: break
+        meetings = res.json().get("data", [])
+        if not meetings: break
+        
+        first_date = meetings[0].get("start", {}).get("datetime", "")
+        is_recent = any(y in first_date for y in TARGET_YEARS)
+        if offset % 1000 == 0 or is_recent:
+             print(f"   🔎 Scanning batch {offset}... ({first_date})", flush=True)
+
+        batch = []
+        for m in meetings:
+            try:
+                m_date = m.get("start", {}).get("datetime", "")
+                if not any(y in m_date for y in TARGET_YEARS): continue 
+
+                mid = m['id'].get('meeting_id') or m['id'].get('record_id')
+                title = m.get('title') or m.get('subject') or "Untitled Meeting"
+                
+                r_res = make_request("GET", f"https://api.attio.com/v2/meetings/{mid}/call_recordings")
+                if not r_res: continue
+                recordings = r_res.json().get("data", [])
+                
+                for r in recordings:
+                    rid = r['id']['call_recording_id']
+                    t_res = make_request("GET", f"https://api.attio.com/v2/meetings/{mid}/call_recordings/{rid}/transcript")
+                    
+                    if t_res and t_res.status_code == 200:
+                        data = t_res.json()
+                        txt = data.get("content_plaintext") or data.get("subtitles") or data.get("text")
+                        if txt:
+                            batch.append({
+                                "id": rid, "type": "call_recording",
+                                "title": f"Transcript: {title}", "content": str(txt),
+                                "url": "https://app.attio.com", 
+                                "metadata": {"meeting_id": mid, "created_at": m_date}
+                            })
+            except: pass
+        safe_upsert(batch)
+        if len(meetings) < limit: break
+        offset += limit
+    print("   ✅ Transcripts Complete.", flush=True)
+
+# --- 2. SYNC NOTES ---
 def sync_notes_cached():
-    print("\n📝 1. Syncing Notes...", flush=True)
+    print("\n📝 2. Syncing Notes (With Dates)...", flush=True)
     targets = ["people", "companies", "deals"]
     for slug in targets:
         limit = 1000
@@ -116,10 +168,7 @@ def sync_notes_cached():
                     pid = n.get('parent_record_id')
                     pname = get_parent_name(slug, pid)
                     raw_title = n.get('title', 'Untitled')
-                    if not raw_title or raw_title == "Untitled":
-                        final_title = f"Note on {pname}"
-                    else:
-                        final_title = f"Note: {raw_title} ({pname})"
+                    final_title = f"Note on {pname}" if not raw_title else f"Note: {raw_title} ({pname})"
                     
                     batch.append({
                         "id": nid, "parent_id": pid, "type": "note",
@@ -134,13 +183,12 @@ def sync_notes_cached():
             offset += limit
     print("   ✅ Notes Complete.", flush=True)
 
-# --- 2. PEOPLE/COMPANIES ---
+# --- 3. PEOPLE/COMPANIES ---
 def sync_standard():
-    print("\n📦 2. Syncing People & Companies...", flush=True)
+    print("\n📦 3. Syncing People & Companies (With Dates)...", flush=True)
     for slug in ["people", "companies"]:
         db_type = "person" if slug == "people" else "company"
-        # Reduced limit to prevent timeouts on heavy records
-        limit = 200 
+        limit = 200
         offset = 0
         while True:
             url = f"https://api.attio.com/v2/objects/{slug}/records/query"
@@ -153,42 +201,52 @@ def sync_standard():
             for d in data:
                 try:
                     rid = d['id']['record_id']
-                    name = "Untitled"
                     vals = d.get('values', {})
-                    if 'name' in vals and vals['name']: name = vals['name'][0]['value']
+                    name = "Untitled"
+                    if 'name' in vals: name = vals['name'][0]['value']
                     elif 'company_name' in vals: name = vals['company_name'][0]['value']
                     elif 'email_addresses' in vals: name = vals['email_addresses'][0]['value']
                     
                     batch.append({
                         "id": rid, "type": db_type, "title": name, "content": str(vals),
-                        "url": f"https://app.attio.com/w/workspace/record/{slug}/{rid}", "metadata": {}
+                        "url": f"https://app.attio.com/w/workspace/record/{slug}/{rid}", 
+                        "metadata": {"created_at": d.get("created_at")}
                     })
                 except: pass
-            
             safe_upsert(batch)
             if len(data) < limit: break
             offset += limit
     print("   ✅ Records Complete.", flush=True)
 
-# --- 3. TASKS ---
+# --- 4. TASKS (THE FIX) ---
 def sync_tasks():
-    print("\n✅ 3. Syncing Tasks...", flush=True)
+    print("\n✅ 4. Syncing Tasks (With Dates)...", flush=True)
     res = make_request("GET", "https://api.attio.com/v2/tasks")
     if not res: return
     batch = []
+    
     for t in res.json().get("data", []):
+        # We prefer the Deadline if available, otherwise creation date
+        date_ref = t.get('deadline_at') or t.get('created_at')
+        
         batch.append({
-            "id": t['id']['task_id'], "type": "task", 
+            "id": t['id']['task_id'], 
+            "type": "task", 
             "title": f"Task: {t.get('content_plaintext', 'Untitled')}",
             "content": f"Status: {t.get('is_completed')}",
-            "url": "https://app.attio.com/w/workspace/tasks", "metadata": {}
+            "url": "https://app.attio.com/w/workspace/tasks", 
+            # FIXED: Now capturing dates correctly
+            "metadata": {
+                "created_at": t.get('created_at'),
+                "deadline": t.get('deadline_at')
+            }
         })
     safe_upsert(batch)
     print("   ✅ Tasks Complete.", flush=True)
 
 if __name__ == "__main__":
     try:
-        # Transcript sync removed to restore stability
+        sync_transcripts()
         sync_notes_cached()
         sync_standard()
         sync_tasks()
