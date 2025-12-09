@@ -12,10 +12,20 @@ st.markdown("""
     hr { margin-top: 0.5rem; margin-bottom: 0.5rem; opacity: 0.2; }
     a { text-decoration: none; color: #007bff !important; }
     a:hover { text-decoration: underline; }
-    .snippet-text { font-size: 14px; color: #333; line-height: 1.6; margin-bottom: 8px; font-family: sans-serif; }
     
+    /* Snippet Text Style */
+    .snippet-text { 
+        font-size: 14px; 
+        color: #333; 
+        line-height: 1.6; 
+        margin-bottom: 8px; 
+        font-family: sans-serif;
+    }
+    
+    /* Hide the default label for the multiselect */
     div[data-testid="stMultiSelect"] label { display: none; }
     
+    /* Green Tags */
     .stMultiSelect span[data-baseweb="tag"] {
         background-color: #d1e7dd !important; 
         border: 1px solid #a3cfbb !important; 
@@ -46,7 +56,7 @@ if not supabase:
     st.error("❌ Could not connect to Supabase. Check Secrets.")
     st.stop()
 
-# --- HELPER: SNIPPET GENERATOR ---
+# --- HELPER: SMART SNIPPET GENERATOR ---
 def get_context_snippet(text, query, window=200):
     if not text: return ""
     text = " ".join(text.split())
@@ -95,6 +105,8 @@ def get_context_snippet(text, query, window=200):
             highlight_terms.append(re.escape(matched_word))
             
         pattern = "|".join(highlight_terms)
+        
+        # Yellow Highlight
         highlight_style = "background-color: #ffd700; color: black; padding: 0 4px; border-radius: 3px; font-weight: bold; box-shadow: 0 1px 2px rgba(0,0,0,0.1);"
         
         snippet = re.sub(
@@ -107,7 +119,7 @@ def get_context_snippet(text, query, window=200):
     else:
         return text[:(window*2)] + "..."
 
-# --- SESSION STATE FOR PAGINATION ---
+# --- SESSION STATE ---
 if 'page' not in st.session_state:
     st.session_state.page = 0
 if 'last_query' not in st.session_state:
@@ -116,15 +128,13 @@ if 'last_query' not in st.session_state:
 # --- UI START ---
 st.title("🔍 Search Attio")
 
-# 1. SEARCH BAR
 query = st.text_input("Search", placeholder='Try "Client Name" -draft ...', label_visibility="collapsed")
 st.caption("Tip: Use quotes for \"exact phrases\", minus for -exclusion, and OR for multiple options.")
 
-# 2. FILTER TOGGLES
 available_types = ["person", "company", "note", "task", "call_recording", "comment", "list", "email"]
 selected_types = st.multiselect("Filter Types", options=available_types, default=available_types)
 
-# RESET PAGINATION IF QUERY CHANGES
+# Auto-reset page on new search
 if query != st.session_state.last_query:
     st.session_state.page = 0
     st.session_state.last_query = query
@@ -139,44 +149,48 @@ if query:
         count = 0
         search_error = None
         
-        # Calculate Range
-        start = st.session_state.page * PAGE_SIZE
-        end = start + PAGE_SIZE - 1
+        # Calculate Offset
+        start_offset = st.session_state.page * PAGE_SIZE
         
-        # --- QUERY EXECUTION ---
         try:
-            # We use select("*", count="exact") to get the total number of matches
+            # 1. Base Query with Count
             req = supabase.table("attio_index").select("*", count="exact")
             req = req.in_("type", selected_types)
             
-            # Hybrid Search Logic (Websearch -> Plain Fallback)
+            # 2. Search Logic (Hybrid)
             try:
-                # Attempt 1: Advanced
-                base_req = req.text_search("fts", query, options={"type": "websearch", "config": "english"})
-                response = base_req.range(start, end).execute()
+                # Attempt 1: Advanced (Websearch)
+                # FIX: Replaced .range() with .limit().offset()
+                response = req.text_search("fts", query, options={"type": "websearch", "config": "english"}) \
+                              .limit(PAGE_SIZE) \
+                              .offset(start_offset) \
+                              .execute()
             except:
                 # Attempt 2: Plain Fallback
-                base_req = req.text_search("fts", query, options={"type": "plain", "config": "english"})
-                response = base_req.range(start, end).execute()
+                # FIX: Replaced .range() with .limit().offset()
+                response = req.text_search("fts", query, options={"type": "plain", "config": "english"}) \
+                              .limit(PAGE_SIZE) \
+                              .offset(start_offset) \
+                              .execute()
             
             results = response.data
-            count = response.count # Total matches in DB
+            count = response.count
             
         except Exception as e:
             search_error = e
 
-        # --- DISPLAY RESULTS ---
+        # --- DISPLAY ---
         if search_error:
             st.error(f"Search failed: {search_error}")
         elif count == 0:
             st.warning(f"No results found for '{query}'")
         else:
-            # Stats Header
-            st.info(f"Found **{count}** matches. Showing {start+1}-{min(end+1, count)}.")
+            # Stats
+            end_display = start_offset + len(results)
+            st.info(f"Found **{count}** matches. Showing {start_offset + 1}-{end_display}.")
             
             for item in results:
                 t = item.get('type', 'unknown')
-                
                 icon = "📄"
                 if t == 'person': icon = "👤"
                 elif t == 'company': icon = "🏢"
@@ -222,7 +236,7 @@ if query:
                     
                     st.divider()
 
-            # --- PAGINATION CONTROLS ---
+            # --- PAGINATION BUTTONS ---
             if count > PAGE_SIZE:
                 col1, col2, col3 = st.columns([1, 2, 1])
                 
@@ -233,7 +247,7 @@ if query:
                             st.rerun()
                 
                 with col3:
-                    if end < count:
+                    if end_display < count:
                         if st.button("Next ➡️"):
                             st.session_state.page += 1
                             st.rerun()
