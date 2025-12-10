@@ -151,3 +151,64 @@ if query:
                             if end_date and item_date > end_date: continue
                             
                             filtered_results.append(item)
+                        except:
+                            filtered_results.append(item) # Keep if date parse fails
+                    else:
+                        filtered_results.append(item) # Keep if no date
+                results = filtered_results
+
+            # 3. SORTING
+            if results:
+                clean_q = re.sub(r'[^\w\s]', '', query)
+                results.sort(key=lambda x: calculate_relevance(x, clean_q), reverse=True)
+
+            # --- DISPLAY ---
+            st.caption(f"Found {len(results)} matches")
+            
+            for item in results:
+                t = item.get('type', 'unknown')
+                icon = "📄"
+                if t == 'person': icon = "👤"
+                elif t == 'company': icon = "🏢"
+                elif t == 'note': icon = "📝"
+                elif t == 'task': icon = "✅"
+                elif t == 'comment': icon = "💬"
+                elif t == 'call_recording': icon = "📞"
+                elif t == 'email': icon = "📧"
+
+                with st.container():
+                    url = item.get('url', '#')
+                    title = item.get('title') or "Untitled"
+                    
+                    st.markdown(
+                        f"""
+                        <div style="font-size: 18px; font-weight: 600; margin-bottom: 2px;">
+                            <a href="{url}" target="_blank">{icon} {title}</a>
+                        </div>
+                        """, unsafe_allow_html=True
+                    )
+                    
+                    meta_info = t.upper()
+                    if item.get("metadata") and item["metadata"].get("created_at"):
+                        date_str = item["metadata"]["created_at"][:10]
+                        meta_info += f" • {date_str}"
+                    st.caption(meta_info)
+
+                    content = item.get('content') or ""
+                    clean_query_display = re.sub(r'[^\w\s]', '', query).strip() 
+                    snippet = get_context_snippet(content, clean_query_display, window=200)
+
+                    if content.startswith("{'") or content.startswith('{"'):
+                            st.info("Match found in Record Metadata")
+                    else:
+                            st.markdown(f'<div class="snippet-text">{snippet}</div>', unsafe_allow_html=True)
+
+                    with st.expander("View Full Content", expanded=False):
+                        if content.startswith("{'") or content.startswith('{"'):
+                                st.code(content, language="json")
+                        else:
+                                st.markdown(f"""<div style="font-size: 14px; white-space: pre-wrap;">{content}</div>""", unsafe_allow_html=True)
+                    st.divider()
+
+        except Exception as e:
+            st.error(f"Search failed: {e}")
