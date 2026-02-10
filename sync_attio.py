@@ -8,7 +8,7 @@ from supabase import create_client, Client
 
 # --- IMMEDIATE ALIVENESS CHECK ---
 print("------------------------------------------------", flush=True)
-print("✅ SCRIPT IS ALIVE. V48 (Smart Auto-Titling) Starting...", flush=True)
+print("✅ SCRIPT IS ALIVE. V49 (Transcripts Removed) Starting...", flush=True)
 print("------------------------------------------------", flush=True)
 
 # --- CONFIG ---
@@ -94,61 +94,9 @@ def get_parent_name(object_slug, record_id):
     except:
         return "Unknown"
 
-# --- 1. SYNC TRANSCRIPTS ---
-def sync_transcripts():
-    print("\n📞 1. Syncing Transcripts...", flush=True)
-    url = "https://api.attio.com/v2/meetings"
-    limit = 100
-    offset = 0
-    TARGET_YEARS = ["2024", "2025"] 
-    
-    while True:
-        res = make_request("GET", url, params={"limit": limit, "offset": offset})
-        if not res or res.status_code != 200: break
-        meetings = res.json().get("data", [])
-        if not meetings: break
-        
-        # Log progress
-        first_date = meetings[0].get("start", {}).get("datetime", "")
-        if offset % 1000 == 0:
-             print(f"   🔎 Scanning batch {offset}... ({first_date})", flush=True)
-
-        batch = []
-        for m in meetings:
-            try:
-                m_date = m.get("start", {}).get("datetime", "")
-                if not any(y in m_date for y in TARGET_YEARS): continue 
-
-                mid = m['id'].get('meeting_id') or m['id'].get('record_id')
-                title = m.get('title') or m.get('subject') or "Untitled Meeting"
-                
-                r_res = make_request("GET", f"https://api.attio.com/v2/meetings/{mid}/call_recordings")
-                if not r_res: continue
-                recordings = r_res.json().get("data", [])
-                
-                for r in recordings:
-                    rid = r['id']['call_recording_id']
-                    t_res = make_request("GET", f"https://api.attio.com/v2/meetings/{mid}/call_recordings/{rid}/transcript")
-                    
-                    if t_res and t_res.status_code == 200:
-                        data = t_res.json()
-                        txt = data.get("content_plaintext") or data.get("subtitles") or data.get("text")
-                        if txt:
-                            batch.append({
-                                "id": rid, "type": "call_recording",
-                                "title": f"Transcript: {title}", "content": str(txt),
-                                "url": "https://app.attio.com", 
-                                "metadata": {"meeting_id": mid, "created_at": m_date}
-                            })
-            except: pass
-        safe_upsert(batch)
-        if len(meetings) < limit: break
-        offset += limit
-    print("   ✅ Transcripts Complete.", flush=True)
-
-# --- 2. SYNC NOTES (SMART TITLES) ---
+# --- 1. SYNC NOTES (SMART TITLES) ---
 def sync_notes_cached():
-    print("\n📝 2. Syncing Notes (Smart Titles)...", flush=True)
+    print("\n📝 1. Syncing Notes (Smart Titles)...", flush=True)
     targets = ["people", "companies", "deals"]
     for slug in targets:
         limit = 1000
@@ -166,29 +114,26 @@ def sync_notes_cached():
                     nid = n['id']['note_id']
                     pid = n.get('parent_record_id')
                     
-                    # 1. Get Parent Name (Company/Person)
+                    # 1. Get Parent Name
                     pname = get_parent_name(slug, pid)
                     
-                    # 2. Get Raw Title & Content
+                    # 2. Get Raw Data
                     raw_title = n.get('title', '').strip()
                     content = n.get('content_plaintext', '').strip()
                     
                     # 3. SMART TITLE LOGIC
                     if raw_title and raw_title != "Untitled":
-                        # If Attio has a real title, use it
                         final_title = f"Note: {raw_title} ({pname})"
                     elif content:
-                        # If no title, take first 60 chars of content
-                        # Replace newlines with spaces for a clean title
+                        # Use first 60 chars of content as title
                         snippet = content[:60].replace('\n', ' ')
                         final_title = f"Note: {snippet}... ({pname})"
                     else:
-                        # Fallback if both are empty
                         final_title = f"Empty Note ({pname})"
                     
                     batch.append({
                         "id": nid, "parent_id": pid, "type": "note",
-                        "title": final_title, # <--- IMPROVED TITLE
+                        "title": final_title,
                         "content": content,
                         "url": f"https://app.attio.com/w/workspace/note/{nid}",
                         "metadata": {"created_at": n.get("created_at"), "parent": pname}
@@ -199,9 +144,9 @@ def sync_notes_cached():
             offset += limit
     print("   ✅ Notes Complete.", flush=True)
 
-# --- 3. PEOPLE/COMPANIES ---
+# --- 2. PEOPLE/COMPANIES ---
 def sync_standard():
-    print("\n📦 3. Syncing People & Companies...", flush=True)
+    print("\n📦 2. Syncing People & Companies...", flush=True)
     for slug in ["people", "companies"]:
         db_type = "person" if slug == "people" else "company"
         limit = 200
@@ -234,28 +179,30 @@ def sync_standard():
             offset += limit
     print("   ✅ Records Complete.", flush=True)
 
-# --- 4. TASKS ---
+# --- 3. TASKS ---
 def sync_tasks():
-    print("\n✅ 4. Syncing Tasks...", flush=True)
+    print("\n✅ 3. Syncing Tasks...", flush=True)
     res = make_request("GET", "https://api.attio.com/v2/tasks")
     if not res: return
     batch = []
     
     for t in res.json().get("data", []):
-        date_ref = t.get('deadline_at') or t.get('created_at')
         batch.append({
-            "id": t['id']['task_id'], "type": "task", 
+            "id": t['id']['task_id'], 
+            "type": "task", 
             "title": f"Task: {t.get('content_plaintext', 'Untitled')}",
             "content": f"Status: {t.get('is_completed')}",
             "url": "https://app.attio.com/w/workspace/tasks", 
-            "metadata": {"created_at": t.get('created_at'), "deadline": t.get('deadline_at')}
+            "metadata": {
+                "created_at": t.get('created_at'),
+                "deadline": t.get('deadline_at')
+            }
         })
     safe_upsert(batch)
     print("   ✅ Tasks Complete.", flush=True)
 
 if __name__ == "__main__":
     try:
-        sync_transcripts()
         sync_notes_cached()
         sync_standard()
         sync_tasks()
