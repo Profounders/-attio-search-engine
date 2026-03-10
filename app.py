@@ -22,19 +22,26 @@ def init_connection():
 
 supabase = init_connection()
 
-# --- HIGHLIGHT HELPER ---
+# --- HIGHLIGHT HELPER (FUZZY VISUALS) ---
 def get_highlighted_snippet(text, query, window=200):
     if not text: return ""
     text = " ".join(text.split())
     
     clean_query = re.sub(r'[^\w\s]', '', query).strip()
-    words = [w for w in clean_query.split() if len(w) > 2]
+    words =[w for w in clean_query.split() if len(w) > 2]
     if not words: return text[:window] + "..."
 
-    # Find first match
+    # Find first match using a root/stem
     match = None
     for word in words:
-        match = re.search(re.escape(word), text, re.IGNORECASE)
+        root = word
+        # Strip common suffixes for the visual highlighter
+        for s in['s', 'es', 'ed', 'ing', 'tion']:
+            if root.endswith(s) and len(root) > 4:
+                root = root[:-len(s)]
+                break
+        
+        match = re.search(re.escape(root), text, re.IGNORECASE)
         if match: break
 
     # Create Snippet Window
@@ -46,7 +53,16 @@ def get_highlighted_snippet(text, query, window=200):
         snippet = text[:window*2] + "..."
 
     # Highlight Words (Yellow)
-    pattern = "|".join([re.escape(w) for w in words])
+    roots = []
+    for w in words:
+        r = w
+        for s in['s', 'es', 'ed', 'ing', 'tion']:
+            if r.endswith(s) and len(r) > 4:
+                r = r[:-len(s)]
+                break
+        roots.append(r)
+        
+    pattern = "|".join([re.escape(r) for r in roots])
     style = "background-color: #ffd700; color: black; padding: 0 2px; border-radius: 3px; font-weight: bold;"
     snippet = re.sub(f"({pattern}\w*)", fr'<span style="{style}">\1</span>', snippet, flags=re.IGNORECASE)
     
@@ -58,15 +74,19 @@ query = st.text_input("Search", placeholder="Search your notes...", label_visibi
 
 if query:
     try:
-        # Hybrid Search against the NEW 'attio_notes' table
+        # THE FIX: .limit() is now BEFORE .text_search()
         try:
+            # 1. Try Advanced Google-Style Search
             res = supabase.table("attio_notes").select("*", count="exact") \
+                .limit(100) \
                 .text_search("fts", query, options={"type": "websearch", "config": "english"}) \
-                .limit(100).execute()
+                .execute()
         except:
+            # 2. Fallback to standard fuzzy search if advanced syntax fails
             res = supabase.table("attio_notes").select("*", count="exact") \
+                .limit(100) \
                 .text_search("fts", query, options={"type": "plain", "config": "english"}) \
-                .limit(100).execute()
+                .execute()
                 
         results = res.data
         count = res.count
@@ -97,4 +117,5 @@ if query:
                     st.divider()
 
     except Exception as e:
-        st.error("Search failed. Please try again.")
+        # This will now print the exact error if it ever fails again
+        st.error(f"Search failed: {e}")
