@@ -22,7 +22,29 @@ def init_connection():
 
 supabase = init_connection()
 
-# --- HIGHLIGHT HELPER (FUZZY VISUALS) ---
+# --- HELPER: RELEVANCE SCORING ---
+def calculate_relevance(item, query):
+    """Scores notes based on how many times the query appears. Titles count more."""
+    content = (item.get('content') or "").lower()
+    title = (item.get('title') or "").lower()
+    
+    # Clean query for scoring
+    clean_q = re.sub(r'[^\w\s]', '', query).strip().lower()
+    words =[w for w in clean_q.split() if len(w) > 2]
+    
+    score = 0
+    for word in words:
+        # Title matches are worth 10 points, content matches are worth 1 point
+        score += (title.count(word) * 10)
+        score += content.count(word)
+    
+    # Bonus for exact phrase match
+    if clean_q in title: score += 20
+    if clean_q in content: score += 5
+        
+    return score
+
+# --- HIGHLIGHT HELPER ---
 def get_highlighted_snippet(text, query, window=200):
     if not text: return ""
     text = " ".join(text.split())
@@ -31,20 +53,16 @@ def get_highlighted_snippet(text, query, window=200):
     words =[w for w in clean_query.split() if len(w) > 2]
     if not words: return text[:window] + "..."
 
-    # Find first match using a root/stem
     match = None
     for word in words:
         root = word
-        # Strip common suffixes for the visual highlighter
         for s in['s', 'es', 'ed', 'ing', 'tion']:
             if root.endswith(s) and len(root) > 4:
                 root = root[:-len(s)]
                 break
-        
         match = re.search(re.escape(root), text, re.IGNORECASE)
         if match: break
 
-    # Create Snippet Window
     if match:
         start = max(0, match.start() - window)
         end = min(len(text), match.end() + window)
@@ -52,7 +70,6 @@ def get_highlighted_snippet(text, query, window=200):
     else:
         snippet = text[:window*2] + "..."
 
-    # Highlight Words (Yellow)
     roots = []
     for w in words:
         r = w
@@ -74,15 +91,13 @@ query = st.text_input("Search", placeholder="Search your notes...", label_visibi
 
 if query:
     try:
-        # THE FIX: .limit() is now BEFORE .text_search()
+        # Hybrid Search
         try:
-            # 1. Try Advanced Google-Style Search
             res = supabase.table("attio_notes").select("*", count="exact") \
                 .limit(100) \
                 .text_search("fts", query, options={"type": "websearch", "config": "english"}) \
                 .execute()
         except:
-            # 2. Fallback to standard fuzzy search if advanced syntax fails
             res = supabase.table("attio_notes").select("*", count="exact") \
                 .limit(100) \
                 .text_search("fts", query, options={"type": "plain", "config": "english"}) \
@@ -94,7 +109,14 @@ if query:
         if count == 0:
             st.warning(f"No notes found for '{query}'")
         else:
-            st.caption(f"Found {count} notes matching your search.")
+            # --- APPLY SORTING HERE ---
+            # Sorts by Relevance Score first. If tied, sorts by created_at date (Newest first).
+            results.sort(
+                key=lambda x: (calculate_relevance(x, query), x.get('created_at') or ""), 
+                reverse=True
+            )
+
+            st.caption(f"Found {count} notes (Sorted by best match)")
             
             for item in results:
                 with st.container():
@@ -103,6 +125,7 @@ if query:
                     
                     # Date
                     if item.get('created_at'):
+                        # Display just the YYYY-MM-DD
                         st.caption(item['created_at'][:10])
 
                     # Snippet
@@ -117,5 +140,4 @@ if query:
                     st.divider()
 
     except Exception as e:
-        # This will now print the exact error if it ever fails again
         st.error(f"Search failed: {e}")
