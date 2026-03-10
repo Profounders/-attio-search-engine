@@ -1,13 +1,8 @@
 import os
 import requests
 from supabase import create_client
-from dotenv import load_dotenv
 
-# Load variables if an env file exists (useful for local testing)
-load_dotenv('env')
-load_dotenv('.env')
-
-print("🚀 Starting Clean Reset: Notes Only Sync (Global)...", flush=True)
+print("🚀 Starting Clean Sync: Notes & Transcripts...")
 
 # --- CONFIG ---
 ATTIO_API_KEY = os.environ.get("ATTIO_API_KEY")
@@ -15,16 +10,10 @@ SUPABASE_URL = os.environ.get("SUPABASE_URL")
 SUPABASE_KEY = os.environ.get("SUPABASE_KEY")
 
 if not ATTIO_API_KEY or not SUPABASE_URL:
-    print("❌ Error: Secrets missing. Ensure they are set in GitHub Actions Secrets.", flush=True)
+    print("❌ Error: Secrets missing.")
     exit(1)
 
-try:
-    supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
-    print("   🔌 DB Connected.", flush=True)
-except Exception as e:
-    print(f"   ❌ DB Connection Failed: {e}", flush=True)
-    exit(1)
-
+supabase = create_client(SUPABASE_URL, SUPABASE_KEY)
 HEADERS = {"Authorization": f"Bearer {ATTIO_API_KEY}", "Accept": "application/json"}
 NAME_CACHE = {} 
 
@@ -41,7 +30,7 @@ def get_parent_name(slug, record_id):
         
         vals = res.json().get("data", {}).get("values", {})
         name = "Unknown"
-        for key in ['name', 'full_name', 'title', 'company_name', 'deal_name']:
+        for key in['name', 'full_name', 'title', 'company_name', 'deal_name']:
             if key in vals and vals[key]:
                 name = vals[key][0]['value']
                 break
@@ -52,11 +41,9 @@ def get_parent_name(slug, record_id):
         return name
     except: return "Unknown"
 
-# --- MAIN SYNC: ALL NOTES ---
+# --- 1. SYNC: ALL NOTES ---
 def sync_all_notes():
-    print("\n🔎 Fetching all notes globally from Attio...", flush=True)
-    
-    # EXACT ALIGNMENT WITH API DOCS: Max limit is 50
+    print("\n🔎 Fetching all notes globally from Attio...")
     limit = 50 
     offset = 0
     total_synced = 0
@@ -66,28 +53,23 @@ def sync_all_notes():
         res = requests.get("https://api.attio.com/v2/notes", headers=HEADERS, params=params)
         
         if res.status_code != 200:
-            print(f"   ❌ API Error {res.status_code}: {res.text}", flush=True)
+            print(f"   ❌ API Error {res.status_code}: {res.text}")
             break
             
         notes = res.json().get("data",[])
-        if not notes: 
-            break # Reached the end
+        if not notes: break 
             
         batch =[]
         for n in notes:
             try:
-                # 1. Extract raw data
                 note_id = n['id']['note_id']
                 parent_id = n.get('parent_record_id')
                 parent_slug = n.get('parent_object') 
                 
                 content = n.get('content_plaintext', '').strip()
                 raw_title = n.get('title', '').strip()
-                
-                # 2. Get the name of the Company/Person
                 parent_name = get_parent_name(parent_slug, parent_id)
                 
-                # 3. Build a beautiful title
                 if raw_title and raw_title != "Untitled":
                     final_title = f"Note: {raw_title} ({parent_name})"
                 elif content:
@@ -96,7 +78,6 @@ def sync_all_notes():
                 else:
                     final_title = f"Empty Note ({parent_name})"
 
-                # 4. Append to database batch
                 batch.append({
                     "id": note_id,
                     "title": final_title,
@@ -104,22 +85,84 @@ def sync_all_notes():
                     "url": f"https://app.attio.com/w/workspace/note/{note_id}",
                     "created_at": n.get("created_at")
                 })
-            except Exception as e:
-                print(f"   ⚠️ Error parsing note: {e}", flush=True)
+            except: pass
         
-        # 5. Save to Supabase
         if batch:
-            try:
-                supabase.table("attio_notes").upsert(batch).execute()
-                total_synced += len(batch)
-                print(f"   💾 Saved batch of {len(batch)}. Total so far: {total_synced}", flush=True)
-            except Exception as e:
-                print(f"   ❌ Database Upsert Error: {e}", flush=True)
+            supabase.table("attio_notes").upsert(batch).execute()
+            total_synced += len(batch)
+            print(f"   💾 Saved {len(batch)} notes. Total: {total_synced}")
             
         if len(notes) < limit: break
         offset += limit
         
-    print(f"\n✅ Sync Complete! Total Notes Synced: {total_synced}", flush=True)
+    print(f"✅ Notes Sync Complete.")
+
+# --- 2. SYNC: RECENT TRANSCRIPTS ---
+def sync_all_transcripts():
+    print("\n📞 Fetching recent meeting transcripts...")
+    
+    limit = 100
+    offset = 0
+    total_synced = 0
+    
+    # CUTOFF: Only check meetings from 2024 onwards to prevent infinite 2013 loops
+    TARGET_YEARS =["2024", "2025", "2026"] 
+    
+    while True:
+        res = requests.get("https://api.attio.com/v2/meetings", headers=HEADERS, params={"limit": limit, "offset": offset})
+        if res.status_code != 200: break
+        meetings = res.json().get("data",[])
+        if not meetings: break
+        
+        batch =[]
+        skipped = 0
+        
+        for m in meetings:
+            try:
+                # 1. Date check (Skip old history instantly)
+                start_date = m.get("start", {}).get("datetime", "")
+                if not any(y in start_date for y in TARGET_YEARS):
+                    skipped += 1
+                    continue
+                
+                mid = m['id'].get('meeting_id') or m['id'].get('record_id')
+                title = m.get('title') or m.get('subject') or "Untitled Meeting"
+                
+                # 2. Check for recordings
+                r_res = requests.get(f"https://api.attio.com/v2/meetings/{mid}/call_recordings", headers=HEADERS)
+                if r_res.status_code != 200: continue
+                recordings = r_res.json().get("data",[])
+                
+                for r in recordings:
+                    rid = r['id']['call_recording_id']
+                    
+                    # 3. Get transcript
+                    t_res = requests.get(f"https://api.attio.com/v2/meetings/{mid}/call_recordings/{rid}/transcript", headers=HEADERS)
+                    if t_res.status_code == 200:
+                        data = t_res.json()
+                        txt = data.get("content_plaintext") or data.get("text") or data.get("subtitles")
+                        
+                        if txt:
+                            print(f"   ✅ Transcript Found: {title}")
+                            batch.append({
+                                "id": rid,
+                                "title": f"Transcript: {title}",
+                                "content": txt,
+                                "url": "https://app.attio.com", # Deep links to meetings are complex, routing to root
+                                "created_at": start_date
+                            })
+            except Exception as e: 
+                pass
+                
+        if batch:
+            supabase.table("attio_notes").upsert(batch).execute()
+            total_synced += len(batch)
+            
+        if len(meetings) < limit: break
+        offset += limit
+        
+    print(f"✅ Transcripts Sync Complete! Total found: {total_synced}")
 
 if __name__ == "__main__":
     sync_all_notes()
+    sync_all_transcripts()
