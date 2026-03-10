@@ -120,14 +120,12 @@ if query:
             
             for item in results:
                 with st.container():
-                    # Dynamic Icon based on Title prefix
-                    icon = "📞" if "Transcript:" in item['title'] else "📄"
-                    
                     # Title & Link
-                    st.markdown(f"""<a href="{item['url']}" target="_blank">{icon} {item['title']}</a>""", unsafe_allow_html=True)
+                    st.markdown(f"""<a href="{item['url']}" target="_blank">📄 {item['title']}</a>""", unsafe_allow_html=True)
                     
                     # Date
                     if item.get('created_at'):
+                        # Display just the YYYY-MM-DD
                         st.caption(item['created_at'][:10])
 
                     # Snippet
@@ -136,7 +134,7 @@ if query:
                     st.markdown(f'<div class="snippet-text">{snippet}</div>', unsafe_allow_html=True)
 
                     # Full Content Expander
-                    with st.expander("View Full Content"):
+                    with st.expander("View Full Note"):
                         st.markdown(f"""<div style="font-size: 14px; white-space: pre-wrap;">{content}</div>""", unsafe_allow_html=True)
                     
                     st.divider()
